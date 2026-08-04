@@ -1,0 +1,19 @@
+{
+  "name": "krosmaga-agent",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "description": "A game engine and search-based agent for a hidden-information, stochastic collectible card game.",
+  "license": "MIT",
+  "scripts": {
+    "test": "vitest run",
+    "test:full": "vitest run --config vitest.full.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.2",
+    "tsx": "^4.22.4",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.7"
+  }
+}

@@ -1,0 +1,19 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+__pycache__/
+*.pyc
+
+# Card data built locally by pipeline/ (not part of the repository).
+# The leading slash matters: without it, data/ would also match src/data/.
+/data/
+/public/
+/workspace/
+**/cards_*.json
+
+# Deck corpus, also built locally (pipeline/extractor.py).
+/decks-corpus/
