@@ -67,22 +67,27 @@ export function determinize(state: GameState, me: Side, rng: Rng): GameState {
 // reals among the survivors (a miscalibrated belief). Pass the destroyed list to
 // count the revealed reals.
 export function resampleEnemyReals(dofuses: DofusInstance[], foe: Side, rng: Rng, destroyed?: { owner: Side; kind: "real" | "fake" }[]): DofusInstance[] {
-  const aliveEnemy = dofuses.filter((d) => d.owner === foe && d.currentLife > 0);
-  const revealedReals =
-    dofuses.filter((d) => d.owner === foe && d.currentLife <= 0 && d.kind === "real").length +
+  // A living enemy Dofus that has been revealed is public information, the player
+  // has seen it. The old filter only kept the destroyed Dofus, so each sampled world
+  // drew again the kind of a Dofus that was already shown. The belief forgot what
+  // was on the screen, and the search explored worlds the player knows are wrong.
+  const isPublicKind = (d: DofusInstance) => d.currentLife <= 0 || !!d.revealed;
+  const hiddenEnemy = dofuses.filter((d) => d.owner === foe && !isPublicKind(d));
+  const knownReals =
+    dofuses.filter((d) => d.owner === foe && isPublicKind(d) && d.kind === "real").length +
     (destroyed ?? []).filter((d) => d.owner === foe && d.kind === "real").length;
-  const realsToPlace = Math.max(0, REAL_PER_SIDE - revealedReals);
+  const realsToPlace = Math.max(0, REAL_PER_SIDE - knownReals);
 
   const key = (x: number, y: number) => `${x},${y}`;
   const realCells = new Set(
     rng
-      .shuffle(aliveEnemy.map((d) => d.position))
+      .shuffle(hiddenEnemy.map((d) => d.position))
       .slice(0, realsToPlace)
       .map((p) => key(p.x, p.y)),
   );
 
   return dofuses.map((d) => {
-    if (d.owner !== foe || d.currentLife <= 0) return d; // mine + revealed: unchanged
+    if (d.owner !== foe || isPublicKind(d)) return d; // mine, the destroyed and the revealed ones stay as they are
     return { ...d, kind: realCells.has(key(d.position.x, d.position.y)) ? "real" : "fake" };
   });
 }

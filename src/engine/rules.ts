@@ -20,7 +20,7 @@ import {
 import type { CreatureInstance, GameEvent, GameState, PendingAction, PlayerState, DofusInstance, TempReversion, SeedInstance, TrapInstance } from "./state";
 import { creatureAt, dofusAt, isCellFree, validSpawnCells } from "./queries";
 import { getCard, isKnownFamily, summonsOfFamily, summonsOfCost, famsOf, registryGeneration } from "./cardRegistry";
-import { applyEffects, effectRequiresTarget, effectTargetFilter, bumpStat, slideCreatureBack, resolveDynamicValue, dofusInvulnerable, transformCreature, woundDofus, sinistroShot, necronomigoreFire } from "./effects";
+import { applyEffects, effectRequiresTarget, effectTargetFilter, bumpStat, readStat, slideCreatureBack, resolveDynamicValue, dofusInvulnerable, transformCreature, woundDofus, sinistroShot, necronomigoreFire } from "./effects";
 import { Rng, randomSeed } from "./rng";
 import type { TriggerType } from "../data/types";
 
@@ -229,6 +229,9 @@ function returnsViaFamilyAura(
   const vSalve = salveOf?.get(dead.instanceId) ?? 0;
   return creatures.some((c) => {
     if (c.owner !== dead.owner || c.instanceId === dead.instanceId) return false;
+    // A silenced creature stops giving its auras (the same rule as in withAuras).
+    // A silenced Excarnus #523 must not bring the dead of its family back to the hand.
+    if (c.silenced) return false;
     const inPlayAtDeath = c.currentLife > 0 ||
       (salveOf !== undefined && !brokeThroughIds?.has(c.instanceId) && (salveOf.get(c.instanceId) ?? 0) >= vSalve);
     if (!inPlayAtDeath) return false;
@@ -289,7 +292,9 @@ function cardMatchesCostScope(card: Card, scope: CostScope): boolean {
 export function cardCostAuraDelta(creatures: CreatureInstance[], side: Side, card: Card, reserves?: Partial<Record<Side, number>>): number {
   let delta = 0;
   for (const c of creatures) {
-    if (c.currentLife <= 0) continue;
+    // Silenced: it no longer gives its cost aura (Alchimiste Armurée #819,
+    // Felida #216, Kabrok #473). Same rule as withAuras.
+    if (c.currentLife <= 0 || c.silenced) continue;
     const own = c.owner === side;
     for (const e of getCard(c.cardId)?.effects ?? []) {
       if (e.type !== "CardCostAura") continue;
@@ -372,7 +377,8 @@ export function effectiveCost(player: PlayerState, card: Card, allies: CreatureI
   // "Vos Butins sont gratuits" (Tolot), a `free` CardCostAura on a living owned
   // creature zeroes the cost of any card matching its scope, overriding everything.
   if (allies.length > 0 && allies.some((c) =>
-    c.currentLife > 0 && c.owner === player.side &&
+    // !c.silenced: a silenced Kriss La Krass #967 no longer plays your Boufballes for free.
+    c.currentLife > 0 && !c.silenced && c.owner === player.side &&
     (getCard(c.cardId)?.effects ?? []).some((e) => {
       if (e.type !== "CardCostAura" || !(e as { free?: boolean }).free) return false;
       const a = e as { scope?: CostScope; cardId?: number };
@@ -386,7 +392,8 @@ export function effectiveCost(player: PlayerState, card: Card, allies: CreatureI
   // that cost (a hard override of the printed cost and any other modifier).
   if (allies.length > 0) {
     for (const c of allies) {
-      if (c.currentLife <= 0 || c.owner !== player.side) continue;
+      // Silenced: it no longer gives its fixed cost aura (Silo #849).
+      if (c.currentLife <= 0 || c.silenced || c.owner !== player.side) continue;
       for (const e of getCard(c.cardId)?.effects ?? []) {
         if (e.type !== "CardCostAura") continue;
         const a = e as { scope?: CostScope; family?: string; setTo?: number };
@@ -942,6 +949,30 @@ function dropUnmetConditions(effects: Effect[], state: GameState, caster: Side, 
   });
 }
 
+// "N damage, or N+B if <condition>" is one single hit worth N or N+B, never two separate hits.
+// Amalia #518 was authored as two AoeDamage (3 then 2) on the same trigger, so each victim went
+// through the defensive chain twice, and that chain applies per hit: a Bouclier only dodged the
+// first one, a Résistance 1 was taken off twice (3-1 + 2-1 = 3 instead of 4), and a cap of "never
+// more than 1 at a time" let 2 through. So the bonus is folded in before applyEffects. No handler
+// in effects.ts sees the GameState, so the condition can only be evaluated here.
+//
+// Guard: DrawCards already applies amount+bonus+condition itself in applyPlayerStateEffect
+// ("Piochez A ou A+B si …", Engrais #164, Sarcophage #469, Souffle #1342). Folding it here too
+// would count the bonus twice, so it is left out on purpose.
+function foldConditionalBonus(effects: Effect[], state: GameState, caster: Side, selfId?: number): Effect[] {
+  return effects.map((e) => {
+    if (e.type === "DrawCards") return e; // already handled downstream, do not count the bonus twice
+    const cond = (e as { condition?: PlayerCondition }).condition;
+    const bonus = (e as { bonus?: number }).bonus;
+    const amount = (e as { amount?: number }).amount;
+    if (!cond || typeof bonus !== "number" || typeof amount !== "number") return e;
+    const folded = { ...(e as object), amount: amount + (conditionMet(state, caster, cond, selfId) ? bonus : 0) } as Record<string, unknown>;
+    delete folded.bonus;
+    delete folded.condition;
+    return folded as unknown as Effect;
+  });
+}
+
 // Flip a coin for `side` ("A OU B"): true = Pile (the positive / first branch).
 // Forced to Pile by Trucage (coinForcedPile) during the active turn, else a
 // 50/50 draw from the seeded RNG (so it is reproducible).
@@ -1120,7 +1151,7 @@ export function fireContreCoup(state: GameState, fromLogIndex: number, inlineBuf
       // Low-PV bounce (Arakne #420 / Grougaloragran #161): reduced to ≤ threshold but
       // alive → it escapes back to its owner's hand (fresh card). Checked before
       // CONTRE_COUP since it leaves the board.
-      const bounce = (getCard(c.cardId)?.effects ?? []).find((e) => e.type === "BounceBelowPv") as { threshold?: number } | undefined;
+      const bounce = c.silenced ? undefined : (getCard(c.cardId)?.effects ?? []).find((e) => e.type === "BounceBelowPv") as { threshold?: number } | undefined;
       if (bounce && c.currentLife <= (bounce.threshold ?? 0)) {
         after = bounceCreature(after, c.position, "hand");
         continue;
@@ -1465,7 +1496,10 @@ function applyKillToButin(
     if (!(getCard(killer.cardId)?.effects ?? []).some((e) => e.type === "TransformKilledToButin")) continue;
     const cell = k.victimPosition;
     if (state.dofuses.some((d) => sameCoords(d.position, cell))) continue; // never under a Dofus
-    if (butins.some((b) => sameCoords(b.position, cell))) continue;        // one Butin per cell
+    // One ground object per cell. The old test only looked at the other butins,
+    // so Toutancoffron stacked its own on a glyph, a seed, a bush, a pile of bones
+    // or a trap. cellHasGroundObject is the same predicate plantSeed already uses.
+    if (cellHasGroundObject({ ...state, butins }, cell)) continue;
     butins = [...butins, { position: { ...cell }, owner: killer.owner }];
     log.push({ type: "NEW_A_O_E", at: { ...cell }, ownerSide: killer.owner, aoeType: "loot" });
     changed = true;
@@ -2533,7 +2567,7 @@ function applyButinReward(state: GameState, side: Side, rng: Rng, at?: Coords): 
 // the picker owns strikes the enemy Dofus on its own row (canonical woundDofus → breaks a
 // Sinistro; skips an invulnerable Dofus; resolveDeathsAndWin settles capture/win).
 function applyButinPickupReactions(state: GameState, side: Side): GameState {
-  const ratchets = state.creatures.filter((c) => c.currentLife > 0 && c.owner === side &&
+  const ratchets = state.creatures.filter((c) => c.currentLife > 0 && !c.silenced && c.owner === side &&
     (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "DamageDofusOnRowOnButinPickup"));
   if (ratchets.length === 0) return state;
   const dofuses = state.dofuses.map((d) => ({ ...d, position: { ...d.position } }));
@@ -2558,7 +2592,7 @@ function applyButinPickupReactions(state: GameState, side: Side): GameState {
 // amount×count (canonical woundDofus, breaks a Sinistro, skips an invulnerable Dofus, settles win).
 function applyEnemyPrismLossReactions(state: GameState, side: Side, count: number): GameState {
   if (count <= 0) return state;
-  const malusses = state.creatures.filter((c) => c.currentLife > 0 && c.owner === side &&
+  const malusses = state.creatures.filter((c) => c.currentLife > 0 && !c.silenced && c.owner === side &&
     (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "DamageDofusOnRowOnEnemyPrismLoss"));
   if (malusses.length === 0) return state;
   const dofuses = state.dofuses.map((d) => ({ ...d, position: { ...d.position } }));
@@ -2780,7 +2814,7 @@ function removeConsumedGlyphs(state: GameState, consumed: Set<string>): GameStat
 function seedStepDamage(creatures: CreatureInstance[], seedOwner: Side): number {
   let dmg = 1;
   for (const c of creatures) {
-    if (c.currentLife <= 0 || c.owner !== seedOwner) continue;
+    if (c.currentLife <= 0 || c.silenced || c.owner !== seedOwner) continue;
     for (const e of getCard(c.cardId)?.effects ?? []) {
       if (e.type === "SeedStepDamage") dmg = Math.max(dmg, ((e as { amount?: number }).amount ?? 1) | 0);
     }
@@ -3241,7 +3275,7 @@ function leavesNenufarSeed(victim: CreatureInstance, creatures: CreatureInstance
   if (vFams.length === 0) return false;
   return creatures.some(
     (c) =>
-      c.currentLife > 0 &&
+      c.currentLife > 0 && !c.silenced &&
       c.owner === victim.owner &&
       c.instanceId !== victim.instanceId &&
       (getCard(c.cardId)?.effects ?? []).some(
@@ -3941,7 +3975,7 @@ function processCombatPhase(state: GameState, side: Side, deferredCounters: { at
   // for the rest of the sweep as before.
   const chiefProviderIds = new Set(
     creatures
-      .filter((c) => c.currentLife > 0 && (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "ChiefAura"))
+      .filter((c) => c.currentLife > 0 && !c.silenced && (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "ChiefAura"))
       .map((c) => c.instanceId),
   );
 
@@ -3999,7 +4033,7 @@ function processCombatPhase(state: GameState, side: Side, deferredCounters: { at
       const roseAmount: Partial<Record<Side, number>> = {};
       for (const c of creatures) {
         if (c.currentLife <= 0) continue;
-        const m = (getCard(c.cardId)?.effects ?? []).find((e) => e.type === "RetaliateAlliesWoundedInCombat") as { amount?: number } | undefined;
+        const m = c.silenced ? undefined : (getCard(c.cardId)?.effects ?? []).find((e) => e.type === "RetaliateAlliesWoundedInCombat") as { amount?: number } | undefined;
         if (m) roseAmount[c.owner] = Math.max(roseAmount[c.owner] ?? 0, m.amount ?? 1);
       }
       if (roseAmount.ally != null || roseAmount.enemy != null) {
@@ -4164,7 +4198,7 @@ function processCombatPhase(state: GameState, side: Side, deferredCounters: { at
 // moves both piles into `banished`.
 function discardsAreBanished(creatures: CreatureInstance[]): boolean {
   return creatures.some(
-    (c) => c.currentLife > 0 && (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "BanishAllDiscards"),
+    (c) => c.currentLife > 0 && !c.silenced && (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "BanishAllDiscards"),
   );
 }
 
@@ -4311,7 +4345,7 @@ export function resolveDeathsAndWin(
   const ccDone = new Map<number, number>();
   const canContreCoup = (c: CreatureInstance) =>
     c.triggers.some((t) => t.trigger === "CONTRE_COUP")
-    || (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "BounceBelowPv");
+    || (!c.silenced && (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "BounceBelowPv"));
   const tookDamageSince = (id: number, from: number): boolean => {
     for (let i = from; i < log.length; i++) {
       const ev = log[i] as { type: string; targetInstanceId?: number; damage?: number; armorHit?: boolean };
@@ -4379,10 +4413,25 @@ export function resolveDeathsAndWin(
           // Bouftou Citrouille #780 (Transform) runs on the snapshot; state-level
           // effects (Bellaphone #356 ReturnToHand bounce) are deferred to the final
           // state. Only fires if the killer survived the trade.
+          // Two bugs added up here:
+          //   1. the scan went back through the whole log, which accumulates over
+          //      the whole game (only createGame clears it);
+          //   2. the source filter was inside the stop condition, so a lethal hit
+          //      without a creature source (a spell has sourceInstanceId -1, a seed
+          //      and a trap have no source field at all) was skipped instead of
+          //      stopping the search.
+          // As a result, finishing a creature with a spell sent the search back to
+          // a hit from an earlier turn, and named as the killer a creature at the
+          // other end of the board, which was then sent back to the hand by a MORT
+          // "l'invocation qui l'a détruite".
+          // The scan now stops at the first damage taken by the victim, and a
+          // killer is only kept if it really is a creature.
           let killerId = -1;
           for (let i = log.length - 1; i >= 0; i--) {
             const ev = log[i] as { type: string; targetInstanceId?: number; sourceInstanceId?: number };
-            if (ev.type === "DAMAGE" && ev.targetInstanceId === me.instanceId && (ev.sourceInstanceId ?? -1) >= 0) { killerId = ev.sourceInstanceId!; break; }
+            if (ev.type !== "DAMAGE" || ev.targetInstanceId !== me.instanceId) continue;
+            if ((ev.sourceInstanceId ?? -1) >= 0) killerId = ev.sourceInstanceId!;
+            break; // the first hit found is the lethal one, with or without a source
           }
           const stateLevel = PLAYER_STATE_TYPES.has(eff.type) || eff.type === "ReturnToHand" || eff.type === "ReturnToDeck" || eff.type === "MoveAdjacentRowRandom";
           if (stateLevel) {
@@ -4524,7 +4573,7 @@ export function resolveDeathsAndWin(
   // `deadCreatures`. A dead Eliacube gives nothing (not in aliveCreatures).
   if (trulyDying.length > 0) {
     for (const c of aliveCreatures) {
-      if (!RESERVE_ON_DEATH_IDS.has(c.cardId)) continue;
+      if (c.silenced || !RESERVE_ON_DEATH_IDS.has(c.cardId)) continue;
       const amt = ((getCard(c.cardId)?.effects ?? []).find((e) => e.type === "AddReserve") as { amount?: number } | undefined)?.amount ?? 1;
       const p = playersAfter[c.owner];
       playersAfter[c.owner] = { ...p, apReserve: p.apReserve + amt * trulyDying.length };
@@ -4881,7 +4930,7 @@ export function resolveDeathsAndWin(
     if (vFams.length === 0) return false;
     const vSalve = salveOf.get(d.instanceId) ?? 0;
     return creatures.some((c) =>
-      c.instanceId !== d.instanceId && c.owner === d.owner &&
+      c.instanceId !== d.instanceId && c.owner === d.owner && !c.silenced &&
       (c.currentLife > 0 || (!brokeThroughIds.has(c.instanceId) && (salveOf.get(c.instanceId) ?? 0) >= vSalve)) &&
       (getCard(c.cardId)?.effects ?? []).some(
         (e) => e.type === "AllyFamilyDeathSeed" && vFams.includes((e as { family: string }).family),
@@ -4939,15 +4988,36 @@ function collectDeadRetaliations(dying: CreatureInstance[], log: GameEvent[]): D
   const out: DeadRetaliation[] = [];
   for (const victim of dying) {
     if (!victim.triggers.some((t) => t.trigger === "CONTRE_COUP")) continue;
+    // Cards whose text makes the effect depend on survival ("s'il survit à des dégâts"): the
+    // CONTRE_COUP slot is only an authoring device for them. They never bank after death, even
+    // when the shape of their effect (AddCardToHand of Tsu Tsu Mikaze #1509) would qualify.
+    if (SURVIVE_ONLY_CC.has(victim.cardId)) continue;
     const cc = victim.triggers.filter((t) => t.trigger === "CONTRE_COUP").flatMap((t) => t.effects);
     const atkEffects = cc.filter((e) => (e as { targetAttacker?: boolean }).targetAttacker);
-    const areaEffects = cc.filter((e) => !(e as { targetAttacker?: boolean }).targetAttacker && !PLAYER_STATE_TYPES.has(e.type));
+    // An effect marked `self` acts on the dying creature itself. The body is removed, there is
+    // nobody left to transform or to kill, and the anchor `targetCell: r.pos` of
+    // applyDeadRetaliations would only point at whatever stands on the cell. The creature has to
+    // survive: the first two Otomaï transform themselves, and Goule Ash is the one that dies.
+    // Measured before the fix: an Otomaï killed by a killer that stops on its cell made the killer
+    // transform (cardId 40 → 223), and a killed Goule Ash #823 made the killer die. Covers #520/#102
+    // Otomaï, #989 Moumoune, #823 Goule Ash, #153/#366/#393 (no more buff given to the killer).
+    const areaEffects = cc.filter((e) =>
+      !(e as { targetAttacker?: boolean }).targetAttacker
+      && !(e as { self?: boolean }).self
+      && !PLAYER_STATE_TYPES.has(e.type));
     const playerEffects = cc.filter((e) => !(e as { targetAttacker?: boolean }).targetAttacker && POSTHUMOUS_PLAYER_STATE_CC.has(e.type));
     if (atkEffects.length === 0 && areaEffects.length === 0 && playerEffects.length === 0) continue;
+    // Same fix as at the MORT targetKiller site: the scan stops at the first
+    // damage taken by the victim instead of skipping the ones without a creature
+    // source. Without it, a death from a spell, a seed or a trap sent the search
+    // back to a hit from an earlier turn, and the posthumous CONTRE COUP struck an
+    // attacker that had not dealt the lethal hit, or had done nothing at all that turn.
     let killerId: number | undefined;
     for (let i = log.length - 1; i >= 0; i--) {
       const ev = log[i];
-      if (ev.type === "DAMAGE" && ev.targetInstanceId === victim.instanceId && ev.sourceInstanceId != null) { killerId = ev.sourceInstanceId; break; }
+      if (ev.type !== "DAMAGE" || ev.targetInstanceId !== victim.instanceId) continue;
+      if (ev.sourceInstanceId != null) killerId = ev.sourceInstanceId;
+      break;
     }
     out.push({ atkEffects, areaEffects, playerEffects, killerId, caster: victim.owner, self: victim.instanceId, cardId: victim.cardId, pos: { ...victim.position } });
   }
@@ -4991,7 +5061,15 @@ function applyDeadRetaliations(state: GameState, rets: DeadRetaliation[]): GameS
     // votre défausse") picked itself back up instead of the previous invocation.
     if (r.playerEffects.length > 0) {
       const before = result.players[r.caster];
-      const di = before.discard.lastIndexOf(r.cardId);
+      // The temporary removal only makes sense for an effect that reads the discard. Of the six
+      // posthumous types (AddSeeds, AddReserve, DrawCards, AddCardToHand, TutorFromDeck, RecoverFromDiscard),
+      // only RecoverFromDiscard reads it. Without this restriction, a card that adds a copy of itself
+      // to the hand (Tsu Tsu Mikaze #1509) made the `movedElsewhere` guard believe that the card of
+      // the dead creature had moved, so it was not put back and left the game. The same risk was
+      // latent for Megathon #159 / Rabet #484 (DrawCards) when the drawn card has the same id as the
+      // dying creature.
+      const readsDiscard = r.playerEffects.some((e) => e.type === "RecoverFromDiscard");
+      const di = readsDiscard ? before.discard.lastIndexOf(r.cardId) : -1;
       if (di >= 0) {
         result = { ...result, players: { ...result.players, [r.caster]: { ...before, discard: [...before.discard.slice(0, di), ...before.discard.slice(di + 1)] } } };
       }
@@ -5052,7 +5130,7 @@ export function seedPlantCost(state: GameState, side: Side): number {
   const foe = other(side);
   let tax = 0;
   for (const c of state.creatures) {
-    if (c.currentLife <= 0 || c.owner !== foe) continue;
+    if (c.currentLife <= 0 || c.silenced || c.owner !== foe) continue;
     for (const e of getCard(c.cardId)?.effects ?? []) {
       if (e.type !== "CardCostAura") continue;
       const a = e as { scope?: CostScope; amount?: number; family?: string; cardId?: number; enemy?: boolean; setTo?: number; requireReserve?: number };
@@ -5225,7 +5303,14 @@ export function drawCard(state: GameState, side: Side): GameState {
   // Hand-cap rule: if the player is already at MAX_HAND, the drawn card is
   // "burned", straight to the discard pile (handled in drawCardFrom). Original
   // Krosmaga behavior; prevents infinite hand stuffing.
-  return fireDrawReactions(drawCardFrom(state, side, side), side);
+  //
+  // A draw from an empty deck fires no ON_DRAW reactor: no card left the deck, so there is no
+  // reaction. It still deals the fatigue (drawCardFrom → applyFatigue). The test is on the size of
+  // the deck, not the hand: a card burned because the hand is full was really drawn, so it does
+  // fire the reactors.
+  const drewSomething = state.players[side].deck.length > 0;
+  const after = drawCardFrom(state, side, side);
+  return drewSomething ? fireDrawReactions(after, side) : after;
 }
 
 /**
@@ -6309,7 +6394,17 @@ function castSpell(state: GameState, card: Card, target: Coords, _playedCostMod 
       else mainEffects.push(e);
     }
   }
-  applyEffects(creatures, dofuses, log, dropUnmetConditions(resolveCounts(mainEffects, creatures, state.seeds ?? [], state.glyphs ?? [], state.activeSide, undefined, state.players[state.activeSide].apReserve, state.players[state.activeSide].hand.length, (state.butins ?? []).length), state, state.activeSide), spellCtx);
+  // Sénilité #1241: mutateStat clamps at 0 (a creature with 1 AT only loses 1, one with 0 AT loses
+  // nothing), and the clamp was lost on the way in but given back on the way out, so the malus
+  // turned into a permanent buff for the opponent. The value before is recorded here to measure,
+  // further down, the delta that was really taken. Limited to effects with a `duration` (the only reversible ones).
+  const tempStatBefore = new Map<string, number>();
+  for (const e of card.effects) {
+    const f = (e as { duration?: string }).duration ? TEMP_STAT_FIELD[e.type] : undefined;
+    if (!f) continue;
+    for (const c of creatures) if (c.currentLife > 0) tempStatBefore.set(`${f}#${c.instanceId}`, readStat(c, f));
+  }
+  applyEffects(creatures, dofuses, log, foldConditionalBonus(dropUnmetConditions(resolveCounts(mainEffects, creatures, state.seeds ?? [], state.glyphs ?? [], state.activeSide, undefined, state.players[state.activeSide].apReserve, state.players[state.activeSide].hand.length, (state.butins ?? []).length), state, state.activeSide), state, state.activeSide), spellCtx);
 
   // TELEPORT (Bond du Félin #472 "téléporte une invocation de 1d6 cases", Fulgurance #14, Bond #429): a
   // creature that lands on a cell after a jump picks up what is there (prism/fléau, seed, butin, gift,
@@ -6355,11 +6450,26 @@ function castSpell(state: GameState, card: Card, target: Coords, _playedCostMod 
     const amt = ((e as { amount?: number }).amount ?? 0) | 0;
     if (!field || amt === 0) continue;
     const scope = (e as { scope?: string }).scope as string | undefined;
-    const affected = creatures
-      .filter((c) => c.currentLife > 0 && tempScopeMatches(c, scope, state.activeSide, target))
-      .map((c) => c.instanceId);
-    if (affected.length === 0) continue;
-    tempReversions.push({ kind: "stat", expireSide, field, amount: -amt, instanceIds: affected });
+    // Group by the delta that was really taken instead of deriving -amt again: the clamp at 0 in
+    // mutateStat makes the malus asymmetric (0 AT − 2 = 0, so nothing to give back; 1 AT − 2 = 0, so
+    // 1 to give back and not 2). Without it, Sénilité #1241 gave a permanent +2 AT to an Eliacube #250
+    // with 0 AT, and a Wall that should never strike started dealing 2 on every contact.
+    //
+    // Known limit: the measure gives the spell credit for every change of the stat during applyEffects.
+    // It is exact as long as one card does not combine two effects on the same stat (none does today).
+    const byDelta = new Map<number, number[]>();
+    for (const c of creatures) {
+      if (c.currentLife <= 0) continue;
+      if (!tempScopeMatches(c, scope, state.activeSide, target)) continue;
+      const before = tempStatBefore.get(`${field}#${c.instanceId}`);
+      if (before === undefined) continue;          // appeared after the spell, never touched
+      const applied = readStat(c, field) - before;
+      if (applied === 0) continue;                 // clamp: no malus taken, nothing to give back
+      const ids = byDelta.get(-applied) ?? [];
+      ids.push(c.instanceId);
+      byDelta.set(-applied, ids);
+    }
+    for (const [amount, instanceIds] of byDelta) tempReversions.push({ kind: "stat", expireSide, field, amount, instanceIds });
   }
 
   // Charge resolves immediately: the targeted creature advances right now (not at end
@@ -6526,7 +6636,7 @@ function castSpell(state: GameState, card: Card, target: Coords, _playedCostMod 
     // follows resolveDeathsAndWin. A plain spread of spellCtx would carry the old object, whose progress
     // would be lost.
     const pushCtx = { ...spellCtx, rng, targetCell: { ...target }, onSlideStep: makeSlideStep(pc, pl, pushTracking) };
-    const pushEffects = dropUnmetConditions(resolveCounts(deferredPush, pc, result.seeds ?? [], result.glyphs ?? [], state.activeSide, undefined, result.players[state.activeSide].apReserve, result.players[state.activeSide].hand.length, (result.butins ?? []).length), result, state.activeSide);
+    const pushEffects = foldConditionalBonus(dropUnmetConditions(resolveCounts(deferredPush, pc, result.seeds ?? [], result.glyphs ?? [], state.activeSide, undefined, result.players[state.activeSide].apReserve, result.players[state.activeSide].hand.length, (result.butins ?? []).length), result, state.activeSide), result, state.activeSide);
     applyEffects(pc, pd, pl, pushEffects, pushCtx);
     result = resolveDeathsAndWin({ ...result, creatures: pc, dofuses: pd, log: pl }, pc, pd, pl, new Set());
     result = removeConsumedSeeds(result, pushTracking.consumedSeedKeys);
@@ -6659,7 +6769,7 @@ const PLAYER_STATE_TYPES: ReadonlySet<string> = new Set([
   "AddCardToHand", "AddRandomFamilyCards", "ControlAround", "GiveSelfToOpponent", "SummonToken", "TutorFromDeck", "RecoverFromDiscard", "ForceCoinPile", "SetDiceFloor", "DiscountNextCard", "BanishOwnDiscard", "BanishFamilyDiscardBuffSelf", "SetDiscardPaysCost", "HandFreeThisTurn", "TriggerRally", "PlaceTrap", "GiveActiveTrap", "RecycleHand", "StampCostReduction", "RecycleFamily", "RecycleGodDrawAny",
   "AddSeeds", "TransformAllSeeds", "TransformSeed", "PlaceSeedsInFront", "TransformIntoSeed", "TransformIntoBush", "TransformSeedToBush", "TransformIntoButin", "TransformAllButins", "PlaceButinInFront",
   "PlaceGlyph", "PlaceTasDOs", "TransformTasDOs", "ConsumeTasDOsBuff", "DrawPerCreatureAround", "DamageEnemiesOnGlyphLines", "DestroyPrism", "DestroyBoardObject", "TransformObjectsToTraps", "PlaceBombe", "PlaceButin", "SpawnButinsOnStartCells", "DropButinStartRow", "GrabAllButins", "GrabButin", "TransformPrismToButin", "TransformPrismToBombe", "BounceGlyphs", "DestroyCardInOpponentHand",
-  "ChangeRowSelf", "DestroyAllEnemyPrisms", "RamasserPrisme", "SacrificePrismBuff", "RevealDofuses", "SwapDofus", "MoveRowDofus", "ShuffleDofus", "BounceClosestOnRow", "BounceColumn", "SpendReserveCharge", "SacrificeForReserve", "DrawSummonFreeElseDiscard", "DestroyOwnGlyphs", "DestroyPrismOnRow", "AttractPrisms", "DiscardRandomHand", "MakeOwnDofusesInvulnerable",
+  "ChangeRowSelf", "DestroyAllEnemyPrisms", "RamasserPrisme", "SacrificePrismBuff", "RevealDofuses", "SwapDofus", "MoveRowDofus", "ShuffleDofus", "BounceClosestOnRow", "BounceColumn", "SpendReserveCharge", "SacrificeForReserve", "DrawSummonFreeElseDiscard", "DestroyOwnGlyphs", "DestroyPrismOnRow", "AttractPrisms", "DiscardRandomHand", "MakeOwnDofusesInvulnerable", "ReplaceSpellsWithSummons",
   "ShieldDofusOnRow", "PlaceNowelGifts",
 ]);
 
@@ -6674,6 +6784,15 @@ const PLAYER_STATE_TYPES: ReadonlySet<string> = new Set([
 const POSTHUMOUS_PLAYER_STATE_CC: ReadonlySet<string> = new Set([
   "AddSeeds", "AddReserve", "DrawCards", "AddCardToHand", "TutorFromDeck", "RecoverFromDiscard",
 ]);
+
+// Cards whose text explicitly requires survival ("s'il survit à des dégâts") while their effect is
+// wired on the CONTRE_COUP slot. They leave the posthumous path entirely: the shape of their effect
+// would qualify (AddCardToHand is in POSTHUMOUS_PLAYER_STATE_CC for Arbre à Chachas #23 / Khan
+// Karkass #45 / Belimberbe #1379, which must bank even when dead), but their text says otherwise.
+// Do not add #102/#520 Otomaï or #989/#823 here (the `self` filter of collectDeadRetaliations
+// already covers them), nor #513/#422 (SummonToken is already outside POSTHUMOUS_PLAYER_STATE_CC):
+// a working Set is not the place to document cards that need nothing.
+const SURVIVE_ONLY_CC: ReadonlySet<number> = new Set([1509]);
 
 // Apply one player-state effect, returning the new state and whether it should end the turn
 // (deferred so draws happen first). Shared by castSpell (spell cast) and runTrigger (APPARITION /
@@ -6765,7 +6884,7 @@ function familyMovePowersNullified(me: CreatureInstance, creatures: readonly Cre
   const myFams = getCard(me.cardId)?.families ?? [];
   if (myFams.length === 0) return false;
   return creatures.some((c) => {
-    if (c.currentLife <= 0 || c.owner !== me.owner || c.instanceId === me.instanceId) return false;
+    if (c.currentLife <= 0 || c.silenced || c.owner !== me.owner || c.instanceId === me.instanceId) return false;
     const m = (getCard(c.cardId)?.effects ?? []).find((x) => x.type === "NullifyFamilyMovePowers") as { family?: string } | undefined;
     return !!m?.family && myFams.includes(m.family);
   });
@@ -6908,7 +7027,11 @@ function applyPlayerStateEffect(
     const keepFamily = (e as { keepFamily?: string }).keepFamily;
     for (let i = 0; i < n; i++) {
       const p0 = result.players[caster];
-      if (p0.deck.length === 0) break;
+      // "Piochez N cartes" is a real draw, not a tutor, so a draw from an empty deck must deal the
+      // fatigue (all your Dofus revealed and 1 damage each). The loop continues instead of breaking,
+      // so that N missed draws give N damage per Dofus. drawCard goes to applyFatigue and fires no
+      // ON_DRAW reactor when the deck is empty.
+      if (p0.deck.length === 0) { result = drawCard(result, caster); continue; }
       // Take the top card and its deck stamp together so deckCostMods stays aligned and the kept card keeps
       // its Vampyro/HORDE −1.
       const { player: p, cardId: drawn, costMod: drawnMod } = removeFromDeckAt(p0, p0.deck.length - 1);
@@ -6930,6 +7053,10 @@ function applyPlayerStateEffect(
         // card going to the graveyard (CARD_MOVED deck→discard).
         result = { ...result, log: [...result.log, { type: "CARD_MOVED", cardId: drawn, from: "deck", to: "discard", side: caster }] };
       }
+      // "Quand vous piochez" reactions (Phorreur Furieux #951 +1 AT, Phorreur Corrompu #1262 lane
+      // damage). A card drawn and then discarded counts, the draw did happen. Placed after the
+      // keep/discard step so that the reactor applies to a settled state.
+      result = fireDrawReactions(result, caster);
     }
   } else if (e.type === "DrawUpTo") {
     // "Chaque joueur pioche jusqu'à avoir N cartes en main", both players
@@ -7659,18 +7786,27 @@ function applyPlayerStateEffect(
     // Chasseur #245: draw the top card. If it is a Summon, it lands in hand at 0 PA
     // (stamp −cost); otherwise it goes straight to the discard.
     const p0 = result.players[caster];
-    if (p0.deck.length > 0) {
+    if (p0.deck.length === 0) {
+      // "Piochez 1 carte": a draw from an empty deck deals the fatigue (rule 11), like its sibling
+      // DrawFiltered. Before, the whole branch was skipped and the spell did nothing at all.
+      result = drawCard(result, caster);
+    } else {
       const drawn = p0.deck[p0.deck.length - 1];
       const deck = p0.deck.slice(0, -1);
       const deckCostMods = (p0.deckCostMods ?? []).slice(0, -1);
       const cd = getCard(drawn);
       const popped = { ...p0, deck, deckCostMods };
       if (cd?.cardType === "Summon") {
-        result = addCardToHand({ ...result, players: { ...result.players, [caster]: popped } }, caster, drawn, 1, -(cd.cost ?? 0));
+        // logDeckToHand before addCardToHand: without this beat the card jumped into the hand instead
+        // of flying from the deck pile in the replay (same convention as DrawFiltered).
+        result = logDeckToHand({ ...result, players: { ...result.players, [caster]: popped } }, caster, drawn);
+        result = addCardToHand(result, caster, drawn, 1, -(cd.cost ?? 0));
       } else {
         // The non-Summon drawn card is discarded, to tokenDiscard if it is a token.
         result = { ...result, players: { ...result.players, [caster]: discardCardFor(popped, drawn) } };
+        result = { ...result, log: [...result.log, { type: "CARD_MOVED", cardId: drawn, from: "deck", to: "discard", side: caster }] };
       }
+      result = fireDrawReactions(result, caster); // "quand vous piochez": both branches count
     }
   } else if (e.type === "BounceColumn") {
     // (Sort) #1269 "remonte les invocations d'une rangée": send every creature in the picked "rangée" =
@@ -8585,6 +8721,66 @@ function applyPlayerStateEffect(
       };
       for (let k = 0; k < moved.length; k++) result = drawCard(result, caster);
     }
+  } else if (e.type === "ReplaceSpellsWithSummons") {
+    // Éternité #1468: "Remplace les autres sorts de votre main par autant d'invocations de votre
+    // pioche." The spells of the hand are put at random places in the deck, and then as many
+    // creatures are drawn in the order of the deck.
+    //
+    // Two steps, and the order matters: the spells are first shuffled into the deck, and the
+    // creatures are taken after. Since the pick is filtered on creatures, the spells that were just
+    // put in cannot come out again right away, wherever they landed.
+    //
+    // "les autres sorts": Éternité has already left the hand when its effect resolves (castSpell
+    // discards it before), so "other" here means "all the remaining spells".
+    //
+    // Tokens (Trucage #1238, Dé Pipé #535, Boufballe #1137…) stay in the hand: a token must never
+    // go into a pile that can be drawn (the same invariant as discardCardFor, which sends them to
+    // tokenDiscard). I am not sure this is the official rule.
+    const p = result.players[caster];
+    const isMovableSpell = (id: number) => getCard(id)?.cardType === "Spell" && !isToken(id);
+    const stayHand: number[] = [], stayMods: number[] = [], stayTemp: number[] = [];
+    const moved: number[] = [], movedMods: number[] = [];
+    p.hand.forEach((id, i) => {
+      if (isMovableSpell(id)) { moved.push(id); movedMods.push(p.handCostMods[i] ?? 0); return; }
+      stayHand.push(id);
+      stayMods.push(p.handCostMods[i] ?? 0);
+      stayTemp.push(p.handCostTempMods?.[i] ?? 0);
+    });
+    if (moved.length > 0) {
+      const baseDeckMods = p.deckCostMods && p.deckCostMods.length === p.deck.length ? [...p.deckCostMods] : p.deck.map(() => 0);
+      // The spells are shuffled at random into the deck (not "sous la pioche" like Goule Taka #871
+      // / Martingale, which say so explicitly; Éternité says "aléatoirement").
+      const pairs: [number, number][] = [
+        ...p.deck.map((c, i) => [c, baseDeckMods[i]] as [number, number]),
+        ...moved.map((c, i) => [c, movedMods[i]] as [number, number]),
+      ];
+      const r = rng ?? new Rng(result.rng);
+      const shuffled = r.shuffle(pairs);
+      let deck = shuffled.map((x) => x[0]);
+      let deckMods = shuffled.map((x) => x[1]);
+      const hand = [...stayHand], handCostMods = [...stayMods];
+      // "dans l'ordre du deck": go down from the top (end of the array = pop()), taking the first
+      // `moved.length` creatures found. With fewer creatures than spells sent back, take as many as
+      // there are (the hand gets smaller), the same outcome as Goule Taka.
+      const tutored: number[] = [];
+      for (let k = 0; k < moved.length; k++) {
+        let idx = -1;
+        for (let j = deck.length - 1; j >= 0; j--) { if (getCard(deck[j])?.cardType === "Summon") { idx = j; break; } }
+        if (idx === -1) break; // no creature left in the deck
+        hand.push(deck[idx]); handCostMods.push(deckMods[idx] ?? 0);
+        stayTemp.push(0); // card tutored from the deck, never overloaded
+        tutored.push(deck[idx]);
+        deck = [...deck.slice(0, idx), ...deck.slice(idx + 1)];
+        deckMods = [...deckMods.slice(0, idx), ...deckMods.slice(idx + 1)];
+      }
+      result = {
+        ...result,
+        rng: r.state, // the shuffle used the stream, so it is banked (same replay)
+        players: { ...result.players, [caster]: { ...p, hand, handCostMods, handCostTempMods: p.handCostTempMods ? stayTemp : undefined, deck, deckCostMods: deckMods } },
+      };
+      // Replay beat: without it the creatures would jump into the hand (see logDeckToHand).
+      for (const id of tutored) result = { ...result, log: [...result.log, { type: "CARD_DRAWN", side: caster, cardId: id, burned: false }] };
+    }
   } else if (e.type === "BanishOwnDiscard") {
     // Emma Cabre #963: "Bannit N carte(s) de votre défausse", the N most-recent
     // discard cards leave the game (→ banished). This is an effect, not a play cost
@@ -8834,7 +9030,8 @@ function bounceCreature(state: GameState, at: Coords, to: "hand" | "deck", toSid
 function buffFamilyOnBounce(state: GameState): GameState {
   const grants: { side: Side; family: string; at: number; ar: number }[] = [];
   for (const c of state.creatures) {
-    if (c.currentLife <= 0) continue;
+    // Silenced: it no longer gives its family buff (Araknoplasme #416).
+    if (c.currentLife <= 0 || c.silenced) continue;
     const m = (getCard(c.cardId)?.effects ?? []).find((e) => e.type === "BuffFamilyOnBounce") as { family?: string; attack?: number; armor?: number } | undefined;
     if (m?.family) grants.push({ side: c.owner, family: m.family, at: m.attack ?? 0, ar: m.armor ?? 0 });
   }
@@ -9122,6 +9319,20 @@ export function withAuras(creatures: CreatureInstance[], seedSides?: Set<Side>):
   //    Tristepin). Continuous: given while a living ally of that family is on the board, taken back
   //    otherwise. This code owns the FirstStrike bit for these creatures (their built-in one is not set
   //    at summon, see summonCreature), so toggling it here is the single source.
+  //
+  // Steps 4 / 4b / 4c / 5 no longer change `properties` directly. They declare what they want to
+  // grant in `condWant`, and a single reconciliation (right after step 5) applies it all, the same
+  // way as step 6. The unconditional add/delete pair used before could not tell a conditional bit
+  // from a bit conferred from outside: Initiative #464 set FirstStrike, then the aura recompute
+  // removed it in the same turn without any log, and the spell was used up for nothing on any
+  // carrier of a conditional initiative (Zorine #668, Tristepin #6, Korbax #379, Grouilleux #309,
+  // Edass #43). Same bug for #683, #259 and #83.
+  const condWant = new Map<number, Set<string>>();
+  const wantProp = (c: CreatureInstance, p: string): void => {
+    let s = condWant.get(c.instanceId);
+    if (!s) { s = new Set<string>(); condWant.set(c.instanceId, s); }
+    s.add(p);
+  };
   for (const c of next) {
     if (c.currentLife <= 0 || c.silenced) continue; // silenced → loses its own conditional initiative
     const conds = auraProfile(c.cardId).condFS;
@@ -9142,9 +9353,7 @@ export function withAuras(creatures: CreatureInstance[], seedSides?: Set<Side>):
           (famsOf(o)).includes(cond.family!),
       );
     });
-    c.properties = new Set(c.properties); // clone before mutating the shared Set
-    if (met) c.properties.add("FirstStrike");
-    else c.properties.delete("FirstStrike");
+    if (met) wantProp(c, "FirstStrike");
   }
   // 4b. Properties while wounded ("BLESSÉ : gagne initiative", Grouilleux #309, Edass #43). Continuous
   //     like step 4: the listed property is given while the creature is wounded and taken back the
@@ -9157,11 +9366,7 @@ export function withAuras(creatures: CreatureInstance[], seedSides?: Set<Side>):
     ) as Array<{ property: string }>;
     if (props.length === 0) continue;
     const wounded = c.currentLife < c.baseLife;
-    c.properties = new Set(c.properties); // clone before mutating the shared Set
-    for (const p of props) {
-      if (wounded) c.properties.add(p.property);
-      else c.properties.delete(p.property);
-    }
+    if (wounded) for (const p of props) wantProp(c, p.property);
   }
   // 4c. Conditional family properties ("Gagne initiative ET inciblable TANT QUE vous avez un AUTRE
   //     <famille> en jeu", Korbax #379, FirstStrike + Untargetable while another living Justicier ally
@@ -9174,39 +9379,50 @@ export function withAuras(creatures: CreatureInstance[], seedSides?: Set<Side>):
       (e) => e.type === "ConditionalFamilyProperties",
     ) as Array<{ properties: string[]; family: string; allCamps?: boolean }>;
     if (conds.length === 0) continue;
-    c.properties = new Set(c.properties); // clone before mutating the shared Set
     for (const cond of conds) {
       const met = next.some(
         (o) => o.currentLife > 0 && o.instanceId !== c.instanceId && (cond.allCamps || o.owner === c.owner) && (famsOf(o)).includes(cond.family),
       );
-      for (const p of cond.properties ?? []) {
-        if (met) c.properties.add(p);
-        else c.properties.delete(p);
-      }
+      if (met) for (const p of cond.properties ?? []) wantProp(c, p);
     }
   }
   // 5. Conditional seed properties ("Gagne initiative et inciblable tant que vous avez une Graine en
   //    jeu", Kolo Kolko). Continuous: the listed properties are given while the creature's owner has at
   //    least 1 planted seed, taken back otherwise. This code owns these bits (not set at summon, see
-  //    summonCreature), so toggling here is the single source. Only runs when seedSides is given (every
-  //    useful recompute passes it); a bare withAuras() leaves the bits as they are rather than wrongly
-  //    clearing them.
-  if (seedSides) {
-    for (const c of next) {
-      if (c.currentLife <= 0 || c.silenced) continue; // silenced → loses its own seed-conditional keywords (Kolo Kolko)
-      const conds = (getCard(c.cardId)?.effects ?? []).filter(
-        (e) => e.type === "ConditionalSeedProperty",
-      ) as Array<{ properties: string[] }>;
-      if (conds.length === 0) continue;
-      const met = seedSides.has(c.owner);
-      c.properties = new Set(c.properties);
-      for (const cond of conds) {
-        for (const p of cond.properties ?? []) {
-          if (met) c.properties.add(p);
-          else c.properties.delete(p);
-        }
+  //    summonCreature), so toggling here is the single source. They are only recomputed when seedSides
+  //    is given (every useful recompute passes it). A bare withAuras() keeps what the previous pass
+  //    granted rather than wrongly clearing it.
+  for (const c of next) {
+    if (c.currentLife <= 0 || c.silenced) continue; // silenced → loses its own seed-conditional keywords (Kolo Kolko)
+    const conds = (getCard(c.cardId)?.effects ?? []).filter(
+      (e) => e.type === "ConditionalSeedProperty",
+    ) as Array<{ properties: string[] }>;
+    if (conds.length === 0) continue;
+    const prevSeed = c.condProperties ?? EMPTY_PROPS;
+    const met = seedSides ? seedSides.has(c.owner) : false;
+    for (const cond of conds) {
+      for (const p of cond.properties ?? []) {
+        // No seedSides, so nothing is known about the seeds: keep things as they were.
+        if (seedSides ? met : prevSeed.has(p)) wantProp(c, p);
       }
     }
+  }
+  // Single reconciliation of steps 4 / 4b / 4c / 5, the same way as step 6: remove exactly what the
+  // previous pass granted (`condProperties`), then grant again what this pass wants, and only
+  // remember what was not already there. A bit set by an outside grant is never in `prev`, so it is
+  // never removed. This is the whole rule that a conferred keyword is permanent (#464/#259/#683/#83).
+  for (const c of next) {
+    const prev = c.condProperties ?? EMPTY_PROPS;
+    const want = condWant.get(c.instanceId) ?? EMPTY_PROPS;
+    if (prev.size === 0 && want.size === 0) continue; // nothing to reconcile (the usual case)
+    const props = new Set(c.properties);              // clone: the engine's copy-on-write invariant
+    for (const p of prev) props.delete(p);
+    const nextCond = new Set<string>();
+    for (const p of want) {
+      if (!props.has(p)) { props.add(p); nextCond.add(p); } // not already innate or granted elsewhere
+    }
+    c.properties = props;
+    c.condProperties = nextCond;
   }
   // 5b. Moon guard (Pleine Lune #746): "Tant qu'une lune est en jeu, les dégâts subis par vos Mulous
   //     sont réduits de 1". A side that owns a living FullMoon creature ("une lune") gives MoonGuard to
@@ -10533,7 +10749,10 @@ function buffOnOverflowDiscard(creatures: CreatureInstance[], n: number): Creatu
 function damageEnemiesOnOverflowDiscard(state: GameState, n: number): GameState {
   if (n <= 0) return state;
   const holders = state.creatures
-    .filter((c) => c.currentLife > 0)
+    // !c.silenced: a silenced Crasslek #355 no longer burns when a full hand
+    // discards. Silence must also hit the abilities carried by a card marker,
+    // not only the stat auras.
+    .filter((c) => c.currentLife > 0 && !c.silenced)
     .map((c) => ({
       instanceId: c.instanceId,
       owner: c.owner,
@@ -10672,7 +10891,7 @@ export function runTrigger(
     // `creatures` copy for counting (zero behaviour change when no snapshot is passed).
     const evalBoard = evalState ?? state;
     const countCreatures = evalState ? evalState.creatures : creatures;
-    const triggerEffects = dropUnmetConditions(resolveCounts(expanded, countCreatures, evalBoard.seeds ?? [], evalBoard.glyphs ?? [], owner.owner, instanceId, evalBoard.players[owner.owner].apReserve, evalBoard.players[owner.owner].hand.length, (evalBoard.butins ?? []).length), evalBoard, owner.owner, instanceId);
+    const triggerEffects = foldConditionalBonus(dropUnmetConditions(resolveCounts(expanded, countCreatures, evalBoard.seeds ?? [], evalBoard.glyphs ?? [], owner.owner, instanceId, evalBoard.players[owner.owner].apReserve, evalBoard.players[owner.owner].hand.length, (evalBoard.butins ?? []).length), evalBoard, owner.owner, instanceId), evalBoard, owner.owner, instanceId);
     for (const eff of triggerEffects) {
       // `targetAttacker` effects (Belgodass #756 silence / Polter #399 transform /
       // Anathar #316 take-control the creature that just hit us) are not applied here:
@@ -10862,7 +11081,13 @@ export function runTrigger(
   // votre camp") carried by some picks.
   const maxAttack = (firstEff as { maxAttack?: number }).maxAttack;
   const minAttack = (firstEff as { minAttack?: number }).minAttack; // Pissenlion #1045 "ayant au moins N AT"
-  const pickFamily = (firstEff as { pickFamily?: string }).pickFamily; // Wa Wabbit #59 "un de vos wabbits"
+  // Wa Wabbit #59 carries its family restriction under `pickFamily`, Tofu Mutant #301 ("Sacrifiez un
+  // Tofu allié") under `family`. The fallback is limited to the Sacrifice type on purpose: on other
+  // effects `family` is not a pick restriction (ChargeAllies, SacrificePoupesque,
+  // AllyFamilyDeathSeed, buff auras…) and a generic fallback would wrongly narrow their targets.
+  const pickFamily =
+    (firstEff as { pickFamily?: string }).pickFamily ??
+    (firstEff.type === "Sacrifice" ? (firstEff as { family?: string }).family : undefined);
   const zone = (firstEff as { zone?: "ownCamp" }).zone;
   // Source creature can never be targeted by its own trigger, so it does not
   // count toward "is there a legal target".
@@ -11079,7 +11304,10 @@ function resolvePendingActionCore(state: GameState, target: Coords): GameState {
   // already chosen, so gate on the same enumeration the UI highlights.
   const heldInvalid =
     !!pending.heldSpell && !validPendingTargets(state).some((c) => sameCoords(c, target));
-  if (clickedSelf || heldInvalid || !cellMatchesFilter(state, target, pending.filter, pending.side, pending.maxAttack, pending.zone, pending.minAttack, pending.family)) {
+  // Same exclusion as in validPendingTargets, so that the programmatic engine (agent, replay,
+  // tests) cannot get around the highlighting and fall back into the landing cell trap.
+  const onOwnLandingCell = landingCellBlocked(pending, target.x, target.y);
+  if (clickedSelf || heldInvalid || onOwnLandingCell || !cellMatchesFilter(state, target, pending.filter, pending.side, pending.maxAttack, pending.zone, pending.minAttack, pending.family)) {
     // Held spell: nothing was committed at the 1st pick, so a click without a valid
     // 2nd target cancels the whole play, pure take-back, the card never left the
     // hand and no AP moved.
@@ -11414,15 +11642,24 @@ function resolvePendingActionCore(state: GameState, target: Coords): GameState {
       ? state.creatures.find((c) => c.instanceId === dofus.protectedBy && c.currentLife > 0)
       : undefined;
     const log = [...state.log];
-    let creatures = state.creatures;
-    let dofuses = state.dofuses;
-    if (guard) {
-      creatures = state.creatures.map((c) => c.instanceId === guard.instanceId ? { ...c, currentLife: Math.max(0, c.currentLife - dmgDofus.amount) } : c);
-      log.push({ type: "DAMAGE", sourceInstanceId: pending.sourceInstanceId ?? -1, targetInstanceId: guard.instanceId, damage: dmgDofus.amount, armorHit: false });
-    } else {
-      dofuses = state.dofuses.map((d) => sameCoords(d.position, dofus.position) ? { ...d, currentLife: Math.max(0, d.currentLife - dmgDofus.amount) } : d);
-      log.push({ type: "DAMAGE", targetCell: { ...dofus.position }, damage: dmgDofus.amount, sourceInstanceId: pending.sourceInstanceId });
-    }
+    // Both branches wrote `currentLife` directly, which broke two invariants of
+    // the engine:
+    //   - "every site that lowers the life of a Dofus must go through woundDofus"
+    //     (see effects.ts): the Dofus branch skipped the shield of Pissenlit #1041,
+    //     the breaking of an attached Sinistro, the ripostes of Julith Jurgen #352
+    //     and Héros Martyr #956, the mirror of Sir Comte Flex #406 and the
+    //     invulnerability test (Artheon #1424, Grougaloragran #397);
+    //   - "damage always goes through the armour chain": the guard branch took
+    //     its life down without its armour and its resistance.
+    // redirectDofusDamage is the canonical path the combat already uses: it skips
+    // an invulnerable Dofus, moves the damage to the guard through the armour
+    // chain, and returns what is left to apply to the Dofus.
+    const creatures = state.creatures.map((c) => ({ ...c, position: { ...c.position }, properties: new Set(c.properties) }));
+    const dofuses = state.dofuses.map((d) => ({ ...d, position: { ...d.position } }));
+    const cible = dofuses.find((d) => sameCoords(d.position, dofus.position))!;
+    const reste = redirectDofusDamage(cible, dmgDofus.amount, creatures, log, pending.sourceInstanceId);
+    if (reste > 0) woundDofus(cible, reste, log, creatures, dofuses);
+    void guard; // the redirection is now decided by redirectDofusDamage
     const settled = resolveDeathsAndWin({ ...state, pendingAction: null }, creatures, dofuses, log, new Set());
     return { ...settled, creatures: withAuras(settled.creatures) };
   }
@@ -12223,6 +12460,24 @@ function cellMatchesFilter(
   }
 }
 
+// During a deferred summon pick, the creature is not on the board yet, so its landing cell is
+// empty and passes the "empty cell of your camp" filters (own_empty_camp…), while in the original
+// game the creature is already on the board when its APPARITION resolves and its own cell is never
+// offered. Chafer Archer #336: the player clicks its landing cell, the Archer lands there, the cell
+// is no longer free when the effect resolves, and since the pick is optional the click counts as a
+// refusal. The Tas d'Os was lost without any log.
+//
+// The deferral is only about display and costs, it must not widen the set of targets. Exception
+// any_cell: the source is meant to be on the board and its own cell stays a valid choice for an
+// area effect (Tikoko #149), and that flow already resolves correctly.
+//
+// No risk of a freeze: the pick was only opened because the trial, where the creature is on the
+// board, had at least one target. The deferred set is the trial set plus maybe the landing cell,
+// so removing that cell gives back exactly the trial set, which is not empty by construction.
+const landingCellBlocked = (p: PendingAction, x: number, y: number): boolean =>
+  !!p.deferredSummon && !!p.summonAfter && p.filter !== "any_cell"
+  && p.summonAfter.cell.x === x && p.summonAfter.cell.y === y;
+
 // Enumerate all cells matching the pending filter, used by the UI to
 // highlight legal targets while a pendingAction is active.
 export function validPendingTargets(state: GameState): Coords[] {
@@ -12250,6 +12505,7 @@ export function validPendingTargets(state: GameState): Coords[] {
       // (re-picking is a no-op that would stall a search; exclude them here).
       if (pending.butinCast && pending.butinCast.cells.some((c) => c.x === x && c.y === y)) continue;
       if (pending.optional && pending.filter !== "any_cell" && source && source.position.x === x && source.position.y === y) continue;
+      if (landingCellBlocked(pending, x, y)) continue; // deferred summon: its own landing cell
       if (cellMatchesFilter(state, { x, y }, pending.filter, pending.side, pending.maxAttack, pending.zone, pending.minAttack, pending.family)) {
         out.push({ x, y });
       }

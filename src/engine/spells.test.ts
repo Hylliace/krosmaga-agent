@@ -4657,6 +4657,24 @@ describe("Mass spells", () => {
     expect(byId(s, 72)!.currentLife).toBe(2); // Chacha ennemi −3
     expect(byId(s, 73)!.currentLife).toBe(5); // Iop intact
   });
+  it("#822 Banqueroute: a target that dies from the hit does not stop the family sweep", () => {
+    // The sibling DamageData is applied first. If the 3 damage kill the target, the old search
+    // (currentLife > 0) failed and the family sweep was simply skipped, so the 6 AP spell turned
+    // into "3 damage". The body is still on its cell until resolveDeathsAndWin has swept, so it
+    // can be found to read its family.
+    card(822); card(135); card(118);
+    const tgt = mkCreature(80, "enemy", { x: 3, y: 2 }, { cardId: 135, currentLife: 3, baseLife: 5 }); // dies
+    const allyChacha = mkCreature(81, "ally", { x: 6, y: 2 }, { cardId: 135, currentLife: 5, baseLife: 5 });
+    const enemyChacha = mkCreature(82, "enemy", { x: 3, y: 0 }, { cardId: 135, currentLife: 5, baseLife: 5 });
+    const iop = mkCreature(83, "ally", { x: 7, y: 2 }, { cardId: 118, currentLife: 5, baseLife: 5 });
+    let s = scenario([tgt, allyChacha, enemyChacha, iop], 822);
+    s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(822), { x: 3, y: 2 });
+    expect(byId(s, 80)).toBeUndefined();       // the target died and was swept
+    expect(byId(s, 81)!.currentLife).toBe(2);  // allied Chacha −3 all the same
+    expect(byId(s, 82)!.currentLife).toBe(2);  // enemy Chacha −3 all the same
+    expect(byId(s, 83)!.currentLife).toBe(5);  // Iop untouched
+  });
   it("#1446 Art Du Fourrage: bounces all invocations back to their owners' hands", () => {
     const ally = mkCreature(60, "ally", { x: 6, y: 1 }, { cardId: 40 });
     const foe = mkCreature(61, "enemy", { x: 4, y: 2 }, { cardId: 69 });
@@ -5084,6 +5102,40 @@ describe("Temporary stat modifier", () => {
     expect(byId(s, 50)!.currentAttack).toBe(3);
     s = endTurn(s); // → caster's (ally) next turn: reversion fires
     expect(byId(s, 50)!.currentAttack).toBe(5);
+  });
+  it("#1241 Sénilité: a creature with 0 AT gains nothing from the reversion (the clamp is not paid back)", () => {
+    // mutateStat clamps at 0: 0 − 2 = 0, no malus taken. The old reversion still gave back +2,
+    // which turned the malus spell into a permanent buff for the opponent. A Wall with 0 AT
+    // (Eliacube #250), which should never strike, started dealing 2.
+    const wall = mkCreature(50, "enemy", { x: 4, y: 2 }, { currentAttack: 0, baseAttack: 0 });
+    let s = scenario([wall], 1241);
+    s = { ...s, prisms: [] };
+    s = playCard(s, card(1241), { x: 5, y: 2 });
+    expect(byId(s, 50)!.currentAttack).toBe(0);
+    s = endTurn(s); s = endTurn(s); // reversion on the caster's turn
+    expect(byId(s, 50)!.currentAttack).toBe(0);
+    s = endTurn(s); s = endTurn(s); // and still 0 two turns later
+    expect(byId(s, 50)!.currentAttack).toBe(0);
+  });
+  it("#1241 Sénilité: a creature with 1 AT loses 1 and gets 1 back, not 2", () => {
+    const weak = mkCreature(50, "enemy", { x: 4, y: 2 }, { currentAttack: 1, baseAttack: 1 });
+    let s = scenario([weak], 1241);
+    s = { ...s, prisms: [] };
+    s = playCard(s, card(1241), { x: 5, y: 2 });
+    expect(byId(s, 50)!.currentAttack).toBe(0); // 1 − 2 clamped at 0, it only lost 1
+    s = endTurn(s); s = endTurn(s);
+    expect(byId(s, 50)!.currentAttack).toBe(1); // only the 1 that was really taken is given back
+  });
+  it("#1241 Sénilité: mixed deltas in the same volley, each one given back at its own size", () => {
+    const full = mkCreature(50, "enemy", { x: 4, y: 0 }, { currentAttack: 5, baseAttack: 5 });
+    const weak = mkCreature(51, "enemy", { x: 4, y: 1 }, { currentAttack: 1, baseAttack: 1 });
+    const wall = mkCreature(52, "enemy", { x: 4, y: 2 }, { currentAttack: 0, baseAttack: 0 });
+    let s = scenario([full, weak, wall], 1241);
+    s = { ...s, prisms: [] };
+    s = playCard(s, card(1241), { x: 5, y: 3 });
+    expect([byId(s, 50)!.currentAttack, byId(s, 51)!.currentAttack, byId(s, 52)!.currentAttack]).toEqual([3, 0, 0]);
+    s = endTurn(s); s = endTurn(s);
+    expect([byId(s, 50)!.currentAttack, byId(s, 51)!.currentAttack, byId(s, 52)!.currentAttack]).toEqual([5, 1, 0]);
   });
 });
 
@@ -5896,11 +5948,25 @@ describe("Buffs « Graines en jeu »", () => {
     const granted = withAuras([kolo], new Set<Side>(["ally"]));
     expect(granted[0].properties.has("FirstStrike")).toBe(true);
     expect(granted[0].properties.has("Untargetable")).toBe(true);
-    // no seed for its side → the bits are revoked, even if previously set
-    const primed = mkCreature(1, "ally", { x: 7, y: 2 }, { cardId: 27, properties: new Set(["FirstStrike", "Untargetable"]) });
-    const revoked = withAuras([primed], new Set<Side>());
+    // The seed is gone, so withAuras removes what it granted itself (through condProperties).
+    // The test starts from the state granted above, not from a creature whose bits were set by
+    // hand: since a conferred keyword is permanent, a bit with no bookkeeping trace counts as
+    // coming from outside and is no longer revoked.
+    const revoked = withAuras(granted, new Set<Side>());
     expect(revoked[0].properties.has("FirstStrike")).toBe(false);
     expect(revoked[0].properties.has("Untargetable")).toBe(false);
+  });
+
+  it("#27 Kolo Kolko: a keyword conferred from outside survives the loss of the seed", () => {
+    // Initiative #464 and similar cards set a permanent bit. withAuras only knows its own
+    // grants, so it must never wipe that one.
+    card(27);
+    const kolo = mkCreature(1, "ally", { x: 7, y: 2 }, { cardId: 27 });
+    const granted = withAuras([kolo], new Set<Side>(["ally"]));       // seed, so FirstStrike is granted
+    const conferred = granted.map((c) => ({ ...c, properties: new Set([...c.properties, "PierceArmor"]) }));
+    const after = withAuras(conferred, new Set<Side>());              // no seed any more
+    expect(after[0].properties.has("FirstStrike")).toBe(false);       // the conditional grant goes away
+    expect(after[0].properties.has("PierceArmor")).toBe(true);        // the conferred keyword stays
   });
 
   it("#27 Kolo Kolko: planting a seed grants it the properties (recompute on plant)", () => {
@@ -10081,6 +10147,32 @@ describe("Sacrifice (Tartanque #154, Tofu Mutant #301)", () => {
     expect(byId(s2, 700)!.currentAttack).toBe(4); // 1 + 3 (victim's AT)
     expect(byId(s2, 700)!.baseMovement).toBe(3);  // 1 + 2 (victim's PM)
   });
+
+  it("#301 Tofu Mutant: the pick only offers allied Tofus (the restriction no longer comes after the fact)", () => {
+    // runTrigger only passed `pickFamily` (Wa Wabbit #59) to the pendingAction, never the `family`
+    // that the Sacrifice of #301 carries. The filter fell back to a bare `ally_creature` and the
+    // engine highlighted every ally. A player who clicked a non-Tofu lost their APPARITION without
+    // sacrificing or gaining anything, a silent cancel.
+    card(301); card(75);
+    const mutant = mkCreature(700, "ally", { x: 6, y: 2 }, { cardId: 301, currentAttack: 1, baseAttack: 1, triggers: card(301).triggers ?? [] });
+    const tofu = mkCreature(701, "ally", { x: 7, y: 1 }, { cardId: 75 });
+    const notTofu = mkCreature(702, "ally", { x: 7, y: 0 }, { cardId: 9999 });
+    const s = runTrigger(scenario([mutant, tofu, notTofu]), "APPARITION", 700);
+    expect(s.pendingAction!.family).toBe("Tofu");
+    const tgts = validPendingTargets(s);
+    expect(tgts.some((c) => c.x === 7 && c.y === 1)).toBe(true);  // the Tofu, offered
+    expect(tgts.some((c) => c.x === 7 && c.y === 0)).toBe(false); // the non-Tofu, no longer offered
+  });
+
+  it("#301 Tofu Mutant: no living allied Tofu, so no pick opens", () => {
+    // hasAtLeastOneTarget now filters by family: no more empty pick when the Tofu died between the
+    // cast and the APPARITION.
+    card(301);
+    const mutant = mkCreature(700, "ally", { x: 6, y: 2 }, { cardId: 301, triggers: card(301).triggers ?? [] });
+    const notTofu = mkCreature(702, "ally", { x: 7, y: 0 }, { cardId: 9999 });
+    const s = runTrigger(scenario([mutant, notTofu]), "APPARITION", 700);
+    expect(s.pendingAction).toBeNull();
+  });
 });
 
 describe("Débuff sur une ligne/rangée (Phaeris #1750, Grokoko #531)", () => {
@@ -11313,6 +11405,181 @@ describe("ON_DRAW reaction ('gagne +N quand vous piochez une carte')", () => {
     const s = drawCard(base, "enemy"); // the enemy draws, not "vous"
     expect(byId(s, 790)!.currentAttack).toBe(2); // unchanged
   });
+
+  it("#951: a draw from an empty deck (fatigue) fires no ON_DRAW reactor", () => {
+    // No card left the deck, so there is no reaction, but the fatigue still applies. The test
+    // is on the deck, not the hand: a card burned because the hand is full was really drawn, so
+    // it counts (covered below).
+    const phorreur = mkCreature(790, "ally", { x: 6, y: 2 }, { cardId: 951, currentAttack: 2, baseAttack: 2, triggers: card(951).triggers ?? [] });
+    const sc = scenario([phorreur]);
+    const base = { ...sc, players: { ...sc.players, ally: { ...sc.players.ally, deck: [] } } };
+    const s = drawCard(base, "ally");
+    expect(byId(s, 790)!.currentAttack).toBe(2);                              // no +1 AT
+    expect(s.log.some((e) => e.type === "NO_MORE_CARD_TO_DRAW")).toBe(true);  // but the fatigue applies
+    expect(s.dofuses.filter((d) => d.owner === "ally").every((d) => d.currentLife === 4)).toBe(true);
+  });
+
+  it("#951: a card burned because the hand is full is still a draw, so the reactor fires", () => {
+    const phorreur = mkCreature(790, "ally", { x: 6, y: 2 }, { cardId: 951, currentAttack: 2, baseAttack: 2, triggers: card(951).triggers ?? [] });
+    const sc = scenario([phorreur]);
+    const full = Array.from({ length: 10 }, () => 16); // MAX_HAND
+    const base = { ...sc, players: { ...sc.players, ally: { ...sc.players.ally, hand: full, handCostMods: full.map(() => 0), deck: [1, 2, 3] } } };
+    const s = drawCard(base, "ally");
+    expect(byId(s, 790)!.currentAttack).toBe(3);
+  });
+});
+
+describe("Éternité #1468: the spells of the hand are shuffled into the deck, then as many creatures come out", () => {
+  // The spells of the hand are put at random places in the deck, and then as many creatures are
+  // drawn in the order of the deck.
+  const setup = (hand: number[], deck: number[], seed = 12345) => {
+    card(1468); card(40); card(69); card(1241); card(220); card(16);
+    let s = scenario([]);
+    return {
+      ...s, prisms: [], rng: seed,
+      players: { ...s.players, ally: { ...s.players.ally, hand: [1468, ...hand], handCostMods: [1468, ...hand].map(() => 0), deck: [...deck], deckCostMods: deck.map(() => 0), ap: 20, maxAp: 20 } },
+    };
+  };
+  const cast = (s: ReturnType<typeof scenario>) => playCard(s, card(1468), { x: 9, y: 2 });
+
+  it("the spells leave the hand and as many creatures arrive", () => {
+    // hand: Éternité + 2 spells (#1241, #220) + 1 creature (#40); deck: 3 creatures
+    const s = cast(setup([1241, 220, 40], [69, 69, 69]));
+    const h = s.players.ally.hand;
+    expect(h).not.toContain(1241);
+    expect(h).not.toContain(220);
+    expect(h).toContain(40);                                   // the creature in the hand does not move
+    expect(h.filter((c) => c === 69)).toHaveLength(2);          // 2 spells sent back, so 2 creatures
+    expect(h).toHaveLength(3);                                  // hand size kept
+  });
+
+  it("the spells are shuffled into the deck (not discarded, not banished, not put at the bottom)", () => {
+    const s = cast(setup([1241, 220], [69, 69]));
+    const p = s.players.ally;
+    expect(p.deck).toContain(1241);
+    expect(p.deck).toContain(220);
+    expect(p.discard).not.toContain(1241);   // not the discard
+    expect(p.banished ?? []).not.toContain(1241);
+    expect(p.deck).toHaveLength(2);          // 2 in, 2 creatures out
+    expect(p.deckCostMods).toHaveLength(p.deck.length); // alignment kept
+  });
+
+  it("the shuffle is random: two different seeds give different deck orders", () => {
+    const deck = [69, 69, 69, 40, 40, 40];
+    const a = cast(setup([1241, 220], deck, 1)).players.ally.deck.join(",");
+    const b = cast(setup([1241, 220], deck, 999)).players.ally.deck.join(",");
+    expect(a).not.toBe(b);
+    // …and it is reproducible with the same seed
+    expect(cast(setup([1241, 220], deck, 1)).players.ally.deck.join(",")).toBe(a);
+  });
+
+  it("fewer creatures in the deck than spells sent back, so take as many as there are", () => {
+    const s = cast(setup([1241, 220], [69])); // 2 spells sent back, only 1 creature available
+    const h = s.players.ally.hand;
+    expect(h.filter((c) => c === 69)).toHaveLength(1);
+    expect(h).toHaveLength(1); // the hand gets smaller, it does not fill up with spells
+    expect(s.players.ally.deck).toHaveLength(2); // both spells are in the deck
+  });
+
+  it("a hand with no other spell changes nothing (and does not use the deck)", () => {
+    const s = cast(setup([40, 40], [69, 69]));
+    expect(s.players.ally.hand.sort()).toEqual([40, 40]);
+    expect(s.players.ally.deck).toHaveLength(2);
+  });
+
+  it("the cost stamps follow the cards both ways", () => {
+    card(1468); card(40); card(69); card(1241);
+    let s = scenario([]);
+    s = { ...s, prisms: [], rng: 7, players: { ...s.players, ally: { ...s.players.ally,
+      hand: [1468, 1241], handCostMods: [0, -2],        // the spell sent back carries a −2 discount
+      deck: [69], deckCostMods: [-1],                    // the tutored creature carries −1
+      ap: 20, maxAp: 20 } } };
+    s = cast(s);
+    const p = s.players.ally;
+    expect(p.hand).toEqual([69]);
+    expect(p.handCostMods).toEqual([-1]);                // the creature's discount follows it into the hand
+    expect(p.deck).toEqual([1241]);
+    expect(p.deckCostMods).toEqual([-2]);                // the spell's discount follows it into the deck
+  });
+
+  it("a CARD_DRAWN beat is logged for each tutored creature (otherwise it jumps in the replay)", () => {
+    const s = cast(setup([1241, 220], [69, 69]));
+    expect(s.log.filter((e) => e.type === "CARD_DRAWN" && (e as { cardId?: number }).cardId === 69)).toHaveLength(2);
+  });
+});
+
+describe("Draw by effect: a real draw (fatigue and reactions), not a tutor", () => {
+  const emptyDeck = (s: ReturnType<typeof scenario>) => ({
+    ...s, prisms: [],
+    players: { ...s.players, ally: { ...s.players.ally, deck: [], deckCostMods: [] } },
+  });
+
+  it("#106 Tofoune: a draw from an empty deck deals fatigue to the allied Dofus (before: nothing at all)", () => {
+    card(106);
+    const tofoune = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 106, triggers: card(106).triggers ?? [] });
+    const s = runTrigger(emptyDeck(scenario([tofoune])), "APPARITION", 1);
+    expect(s.log.some((e) => e.type === "NO_MORE_CARD_TO_DRAW")).toBe(true);
+    expect(s.log.some((e) => e.type === "DOFUS_REVEALED")).toBe(true);
+    expect(s.dofuses.filter((d) => d.owner === "ally").every((d) => d.currentLife === 4)).toBe(true);
+  });
+
+  it("#415 Tofu Céleste: 3 draws from an empty deck give 3 damage per Dofus (the `continue`, not the `break`)", () => {
+    card(415);
+    const tofu = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 415, triggers: card(415).triggers ?? [] });
+    const s = runTrigger(emptyDeck(scenario([tofu])), "APPARITION", 1);
+    const n = (card(415).triggers ?? []).flatMap((t) => t.effects)
+      .filter((e) => e.type === "DrawFiltered")
+      .reduce((acc, e) => acc + (((e as { amount?: number }).amount ?? 0) | 0), 0);
+    expect(n).toBeGreaterThan(1); // the card does draw several times
+    expect(s.dofuses.filter((d) => d.owner === "ally").every((d) => d.currentLife === 5 - n)).toBe(true);
+  });
+
+  it("#106 Tofoune + Phorreur Furieux #951: the reactor fires on both branches (kept and discarded)", () => {
+    card(106); card(951); card(16);
+    const mk = (deckTop: number) => {
+      const tofoune = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 106, triggers: card(106).triggers ?? [] });
+      const phorreur = mkCreature(2, "ally", { x: 7, y: 1 }, { cardId: 951, currentAttack: 2, baseAttack: 2, triggers: card(951).triggers ?? [] });
+      const sc = scenario([tofoune, phorreur]);
+      return { ...sc, prisms: [], players: { ...sc.players, ally: { ...sc.players.ally, deck: [deckTop], deckCostMods: [0] } } };
+    };
+    // discarded branch: #16 is not a Tofu
+    expect(byId(runTrigger(mk(16), "APPARITION", 1), 2)!.currentAttack).toBe(3);
+    // kept branch: #106 is itself a Tofu
+    expect(byId(runTrigger(mk(106), "APPARITION", 1), 2)!.currentAttack).toBe(3);
+  });
+
+  it("#245 Chasseur: a draw from an empty deck deals fatigue (before: the spell did nothing at all)", () => {
+    card(245);
+    let s = emptyDeck(scenario([], 245));
+    s = playCard(s, card(245), { x: 8, y: 2 });
+    expect(s.log.some((e) => e.type === "NO_MORE_CARD_TO_DRAW")).toBe(true);
+    expect(s.dofuses.filter((d) => d.owner === "ally").every((d) => d.currentLife === 4)).toBe(true);
+  });
+
+  it("#245 Chasseur + #951: the draw fires the reactor", () => {
+    card(245); card(951);
+    const phorreur = mkCreature(2, "ally", { x: 7, y: 1 }, { cardId: 951, currentAttack: 2, baseAttack: 2, triggers: card(951).triggers ?? [] });
+    let s = scenario([phorreur], 245);
+    s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, hand: [245], handCostMods: [0], deck: [16], deckCostMods: [0] } } };
+    s = playCard(s, card(245), { x: 8, y: 2 });
+    expect(byId(s, 2)!.currentAttack).toBe(3);
+  });
+
+  it("#245 Chasseur: the log beats for deck to hand and deck to discard exist", () => {
+    // Without them the card jumps in the replay. DrawFiltered already logged them, this one did not.
+    card(245); card(40); card(1241);
+    const play = (deckTop: number) => {
+      let s = scenario([], 245);
+      s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, hand: [245], handCostMods: [0], deck: [deckTop], deckCostMods: [0] } } };
+      return playCard(s, card(245), { x: 8, y: 2 });
+    };
+    const summon = play(40); // #40 Bouftou Noir is a creature, so it goes to the hand at 0 AP
+    expect(summon.log.some((e) => e.type === "CARD_DRAWN" && e.cardId === 40)).toBe(true);
+    expect(summon.players.ally.hand).toContain(40);
+    const spell = play(1241); // #1241 Sénilité is a spell, so it goes to the discard
+    expect(spell.log.some((e) => e.type === "CARD_MOVED" && e.cardId === 1241 && e.from === "deck" && e.to === "discard")).toBe(true);
+    expect(spell.players.ally.discard).toContain(1241);
+  });
 });
 
 describe("HORDE: a HORDE creature's death discounts the owner's HORDE cards (hand + deck)", () => {
@@ -11868,6 +12135,26 @@ describe("Chafer Archer #336 : APPARITION → pose un Tas d'os allié sur une ca
     s = resolvePendingAction(s, { x: 6, y: 1 }); // case vide du camp allié (cols 5..8)
     expect(s.creatures.some((c) => c.cardId === 336)).toBe(true); // le Chafer Archer a atterri
     expect((s.tasDOs ?? []).some((t) => t.owner === "ally" && t.position.x === 6 && t.position.y === 1)).toBe(true);
+    expect(s.pendingAction).toBeNull();
+  });
+
+  it("its own landing cell is not offered (it is only empty because the summon is deferred)", () => {
+    // The deferred summon keeps the Archer off the board, so (8,2) passes the own_empty_camp filter
+    // and the UI highlighted it. When the effect resolves the Archer is on that cell, the filter
+    // fails, and since the pick is optional the click counted as a refusal: the Tas d'os was lost
+    // without any log.
+    const s = play336();
+    const tgts = validPendingTargets(s);
+    expect(tgts.some((c) => c.x === 8 && c.y === 2)).toBe(false); // its landing cell, left out
+    expect(tgts.some((c) => c.x === 6 && c.y === 1)).toBe(true);  // the other cells of the camp, unchanged
+    expect(tgts.length).toBeGreaterThan(0);                       // never a pending with zero targets
+  });
+
+  it("clicking its landing cell anyway is an explicit refusal (the Archer lands, no Tas d'os)", () => {
+    let s = play336();
+    s = resolvePendingAction(s, { x: 8, y: 2 });
+    expect(s.creatures.some((c) => c.cardId === 336 && c.position.x === 8 && c.position.y === 2)).toBe(true);
+    expect(s.tasDOs ?? []).toHaveLength(0);
     expect(s.pendingAction).toBeNull();
   });
 
@@ -12831,6 +13118,85 @@ describe("Tsu Tsu Mikaze #1509 : CONTRE COUP (survit aux dégâts) → ajoute un
     expect(s.players.ally.hand.length).toBe(before + 1);
     expect(s.players.ally.hand).toContain(1509); // une copie de lui-même
   });
+  it("killed by damage: no copy in the hand, and its card does go to the discard", () => {
+    // The text makes the copy depend on survival. AddCardToHand is still in
+    // POSTHUMOUS_PLAYER_STATE_CC (for Arbre à Chachas #23 / Khan Karkass #45), hence the per-card
+    // gate SURVIVE_ONLY_CC. A side effect fixed on the way: the copy that was just added made the
+    // `movedElsewhere` guard believe the card of the dead creature had moved, so it was not put
+    // back in the discard and left the game.
+    card(1509);
+    const tsu = mkCreature(1, "ally", { x: 6, y: 2 }, {
+      cardId: 1509, currentLife: 1, baseLife: 3, currentAttack: 1, baseAttack: 1,
+      triggers: card(1509).triggers ?? [],
+    });
+    const killer = mkCreature(2, "enemy", { x: 5, y: 2 }, {
+      cardId: 40, currentLife: 10, baseLife: 10, currentAttack: 3, baseAttack: 3,
+      movementLeft: 1, baseMovement: 1,
+    });
+    let s = scenario([tsu, killer]);
+    s = { ...s, prisms: [], activeSide: "enemy" };
+    s = endTurn(s);
+    expect(byId(s, 1)).toBeUndefined();                    // really dead
+    expect(s.players.ally.hand).not.toContain(1509);       // no copy given
+    expect(s.players.ally.discard).toContain(1509);        // its card did not leave the game
+  });
+});
+
+describe("CONTRE COUP acting on itself: once dead, there is nobody left to transform or to kill", () => {
+  // The creature has to survive. The posthumous path put these effects in `areaEffects` and
+  // replayed them anchored on the cell of the dead creature, but the melee killer moves onto that
+  // cell before the sweep, so the effect applied to the killer. An intermittent bug: only when the
+  // killer stops on the cell.
+  const meleeKill = (victimCardId: number, victimLife: number) => {
+    card(victimCardId);
+    const victim = mkCreature(1, "ally", { x: 6, y: 2 }, {
+      cardId: victimCardId, currentLife: victimLife, baseLife: victimLife + 1,
+      currentAttack: 1, baseAttack: 1, triggers: card(victimCardId).triggers ?? [],
+    });
+    const killer = mkCreature(2, "enemy", { x: 5, y: 2 }, {
+      cardId: 40, currentLife: 10, baseLife: 10, currentAttack: 4, baseAttack: 4,
+      movementLeft: 1, baseMovement: 1, // 1 MP: it stops on the cell of the dead creature, the tricky case
+    });
+    let s = scenario([victim, killer]);
+    return endTurn({ ...s, prisms: [], activeSide: "enemy" });
+  };
+
+  it("#520 Otomaï killed: the killer is not transformed", () => {
+    const s = meleeKill(520, 4);
+    expect(byId(s, 1)).toBeUndefined();
+    expect(byId(s, 2)!.cardId).toBe(40); // before the fix: it turned into a random 4 AP creature
+    expect(s.log.some((e) => String(e.type).includes("TRANSFORM"))).toBe(false);
+  });
+  it("#102 Otomaï killed: the killer is not transformed", () => {
+    const s = meleeKill(102, 4);
+    expect(byId(s, 2)!.cardId).toBe(40);
+  });
+  it("#989 Moumoune killed: the killer is not transformed into a Phorzerker", () => {
+    const s = meleeKill(989, 4);
+    expect(byId(s, 2)!.cardId).toBe(40);
+  });
+  it("#823 Goule Ash killed: its CONTRE COUP (Meurt) does not kill its killer", () => {
+    const s = meleeKill(823, 4);
+    const k = byId(s, 2);
+    expect(k).toBeDefined();          // before the fix: the killer died
+    expect(k!.currentLife).toBeGreaterThan(0);
+  });
+  it("no regression: a resource CONTRE COUP still banks even when dead (Khan Karkass #45 → Fan #70)", () => {
+    card(45); card(70);
+    const khan = mkCreature(1, "ally", { x: 6, y: 2 }, {
+      cardId: 45, currentLife: 4, baseLife: 5, currentAttack: 1, baseAttack: 1,
+      triggers: card(45).triggers ?? [],
+    });
+    const killer = mkCreature(2, "enemy", { x: 5, y: 2 }, {
+      cardId: 40, currentLife: 10, baseLife: 10, currentAttack: 4, baseAttack: 4,
+      movementLeft: 1, baseMovement: 1,
+    });
+    let s = scenario([khan, killer]);
+    s = endTurn({ ...s, prisms: [], activeSide: "enemy" });
+    expect(byId(s, 1)).toBeUndefined();
+    expect(s.players.ally.hand).toContain(70);     // the Fan still arrives
+    expect(s.players.ally.discard).toContain(45);  // and its card goes to the discard
+  });
 });
 
 describe("Jiji #465 : FIN DU TOUR → ajoute 2 poils dans la main ADVERSE", () => {
@@ -12955,7 +13321,7 @@ describe("Sentinelle Affûtée #1606 : +1 AT/+1 AR par lancer allié (déjà har
 
 describe("Wa Wabbit #59 : APPARITION → transforme un de tes Wabbits en Wobot (pick famille)", () => {
   it("le pick est restreint aux Wabbits ALLIÉS (« un de vos Wabbits », un Wabbit ENNEMI n'est pas ciblable)", () => {
-    card(59); card(395); card(450); card(16);
+    card(59); card(230); card(450); card(16);
     const wawabbit = mkCreature(1350, "ally", { x: 6, y: 2 }, { cardId: 59, triggers: card(59).triggers ?? [] });
     const wabbit = mkCreature(1351, "ally", { x: 7, y: 1 }, { cardId: 450 });      // Tiwabbit Tados (Wabbit allié)
     const other = mkCreature(1352, "ally", { x: 7, y: 3 }, { cardId: 16 });        // non-Wabbit allié
@@ -12965,8 +13331,22 @@ describe("Wa Wabbit #59 : APPARITION → transforme un de tes Wabbits en Wobot (
     expect(s.pendingAction?.family).toBe("Wabbit");          // filtré famille Wabbit
     expect(s.pendingAction?.filter).toBe("ally_creature");   // … ET camp allié (« vos »)
     expect(byId(resolvePendingAction(s, { x: 7, y: 3 }), 1352)!.cardId).toBe(16);  // non-Wabbit allié → refusé
-    expect(byId(resolvePendingAction(s, { x: 2, y: 2 }), 1353)!.cardId).toBe(450); // Wabbit ENNEMI → refusé (le fix)
-    expect(byId(resolvePendingAction(s, { x: 7, y: 1 }), 1351)!.cardId).toBe(395); // Wabbit allié → Wobot
+    expect(byId(resolvePendingAction(s, { x: 2, y: 2 }), 1353)!.cardId).toBe(450); // enemy Wabbit, refused (the fix)
+    expect(byId(resolvePendingAction(s, { x: 7, y: 1 }), 1351)!.cardId).toBe(230); // allied Wabbit → Wobot 02
+  });
+  it("the Wabbit does become Wobot 02 #230 (5/4 + MORT), not Wobot 01 #395 (3/4 + CHEF)", () => {
+    // The text says "en Wobot 02": #230 (cost 7, 5 AT / 4 HP, "MORT : Invoque un Wabbit").
+    // The shipped data pointed to #395 "Wobot 01" (cost 4, 3/4, CHEF aura): the parser resolved the
+    // token by removing the digits from the name, which merges "Wobot 01" and "Wobot 02".
+    card(59); card(230); card(450);
+    const wawabbit = mkCreature(1360, "ally", { x: 6, y: 2 }, { cardId: 59, triggers: card(59).triggers ?? [] });
+    const wabbit = mkCreature(1361, "ally", { x: 7, y: 1 }, { cardId: 450 });
+    const s = runTrigger(scenario([wawabbit, wabbit]), "APPARITION", 1360);
+    const r = byId(resolvePendingAction(s, { x: 7, y: 1 }), 1361)!;
+    expect(r.cardId).toBe(230);
+    expect(r.currentAttack).toBe(5);
+    expect(r.currentLife).toBe(4);
+    expect(r.triggers.some((t) => t.trigger === "MORT")).toBe(true); // the pay-off of the 8 AP card
   });
 });
 
@@ -14667,6 +15047,77 @@ describe("Initiative #464", () => {
     expect(byId(s1, 2)!.properties.has("FirstStrike")).toBe(true);  // ally b
     expect(byId(s1, 3)!.properties.has("FirstStrike")).toBe(false); // enemy unaffected
   });
+
+  // A keyword conferred from outside is permanent on its carrier. Before the fix, withAuras
+  // wiped the bit at the first recompute (an unconditional delete in steps 4/4b/4c/5): the spell
+  // was paid 3 AP, the card was discarded, and nothing happened at all, with no log or message,
+  // on any carrier of a conditional initiative. Measured with a probe.
+  const grantInitiative = (carrier: ReturnType<typeof mkCreature>, others: ReturnType<typeof mkCreature>[] = []) => {
+    card(464);
+    let s = scenario([carrier, ...others], 464);
+    s = { ...s, prisms: [] };
+    return playCard(s, card(464), { ...carrier.position });
+  };
+
+  it("#464 on Zorine #668 when not outnumbered: the initiative is set and no longer wiped", () => {
+    card(668);
+    const zorine = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 668 });
+    const ally2 = mkCreature(2, "ally", { x: 7, y: 1 }, {});
+    const foe = mkCreature(3, "enemy", { x: 3, y: 1 }, {}); // 2 allies vs 1, so not outnumbered
+    const s = grantInitiative(zorine, [ally2, foe]);
+    expect(byId(s, 1)!.properties.has("FirstStrike")).toBe(true);
+  });
+
+  it("#464 on a wounded Grouilleux #309: it keeps the initiative once healed to full life", () => {
+    // The flip of the carrier's own condition (wounded to full) does not take back a keyword
+    // that came from outside.
+    card(309);
+    const grouilleux = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 309, currentLife: 2, baseLife: 5 });
+    let s = grantInitiative(grouilleux);
+    expect(byId(s, 1)!.properties.has("FirstStrike")).toBe(true);
+    s = { ...s, creatures: withAuras(s.creatures.map((c) => (c.instanceId === 1 ? { ...c, currentLife: c.baseLife } : c))) };
+    expect(byId(s, 1)!.properties.has("FirstStrike")).toBe(true); // healed, it keeps what the spell granted
+  });
+
+  it("#464 on Korbax #379 alone: the initiative holds, and its conditional untargetable stays conditional", () => {
+    card(379);
+    const korbax = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 379 });
+    const s = grantInitiative(korbax);
+    expect(byId(s, 1)!.properties.has("FirstStrike")).toBe(true);   // conferred, so permanent
+    expect(byId(s, 1)!.properties.has("Untargetable")).toBe(false); // no other Justicier, so still revoked
+  });
+
+  it("no regression: a Zorine with no outside grant loses the initiative when it is no longer outnumbered", () => {
+    card(668);
+    const zorine = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 668 });
+    const foe1 = mkCreature(2, "enemy", { x: 3, y: 1 }, {});
+    const foe2 = mkCreature(3, "enemy", { x: 3, y: 3 }, {});
+    const outnumbered = withAuras([zorine, foe1, foe2]); // 1 vs 2, outnumbered
+    expect(outnumbered.find((c) => c.instanceId === 1)!.properties.has("FirstStrike")).toBe(true);
+    const even = withAuras(outnumbered.filter((c) => c.instanceId !== 3)); // 1 vs 1, no longer outnumbered
+    expect(even.find((c) => c.instanceId === 1)!.properties.has("FirstStrike")).toBe(false);
+  });
+
+  it("no regression: Korbax #379 loses untargetable when the last other Justicier dies", () => {
+    card(379); card(130);
+    const korbax = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 379 });
+    const justicier = mkCreature(2, "ally", { x: 7, y: 2 }, { cardId: 130 });
+    const withMate = withAuras([korbax, justicier]);
+    expect(withMate.find((c) => c.instanceId === 1)!.properties.has("Untargetable")).toBe(true);
+    const alone = withAuras(withMate.map((c) => (c.instanceId === 2 ? { ...c, currentLife: 0 } : c)));
+    expect(alone.find((c) => c.instanceId === 1)!.properties.has("Untargetable")).toBe(false);
+  });
+
+  it("silence takes back a conferred keyword (it wipes every property)", () => {
+    card(668); card(220);
+    const zorine = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 668 });
+    let s = grantInitiative(zorine);
+    expect(byId(s, 1)!.properties.has("FirstStrike")).toBe(true);
+    s = { ...s, players: { ...s.players, ally: { ...s.players.ally, hand: [220], handCostMods: [0], ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(220), { x: 6, y: 2 });
+    expect(byId(s, 1)!.silenced).toBe(true);
+    expect(byId(s, 1)!.properties.has("FirstStrike")).toBe(false);
+  });
 });
 
 describe("Empty-trigger summons (APPARITION/MORT/COUP DE GRÂCE)", () => {
@@ -16047,6 +16498,34 @@ describe("Amalia #518 / Arakne à Crochets #1457", () => {
     const enemyRow2 = mkCreature(2, "enemy", { x: 3, y: 2 }, { currentLife: 9, baseLife: 9 });
     const s2 = runTrigger(scenario([amalia2, tofuBro, enemyRow2]), "APPARITION", 1);
     expect(byId(s2, 2)!.currentLife).toBe(4); // ennemi de sa ligne −5 (autre Confrérie en jeu)
+  });
+  describe("#518: « 3 OU 5 » is one single hit, never 3 then 2", () => {
+    // The defensive chain applies per hit, so splitting into 3+2 changed the total as soon as the
+    // target had a Bouclier, Résistance, Vulnérabilité or a damage cap.
+    const hit = (over: Partial<Parameters<typeof mkCreature>[3]>) => {
+      card(518); card(51);
+      const amalia = mkCreature(1, "ally", { x: 7, y: 2 }, { cardId: 518, triggers: card(518).triggers ?? [] });
+      const bro = mkCreature(4, "ally", { x: 8, y: 0 }, { cardId: 51 }); // Confrérie du Tofu, so the hit is 5
+      const victim = mkCreature(2, "enemy", { x: 3, y: 2 }, { currentLife: 9, baseLife: 9, ...over });
+      return runTrigger(scenario([amalia, bro, victim]), "APPARITION", 1);
+    };
+    it("Bouclier: the single hit of 5 is fully absorbed", () => {
+      const s = hit({ properties: new Set(["Shield"]) });
+      expect(byId(s, 2)!.currentLife).toBe(9);                      // before: 3 used up the shield, then 2 went through
+      expect(byId(s, 2)!.properties.has("Shield")).toBe(false);     // the shield is used up
+    });
+    it("Résistance 1: 5 − 1 = 4 taken (and not (3−1)+(2−1) = 3)", () => {
+      expect(byId(hit({ resistance: 1 }), 2)!.currentLife).toBe(5);
+    });
+    it("Vulnérabilité 1: 5 + 1 = 6 taken (and not (3+1)+(2+1) = 7)", () => {
+      expect(byId(hit({ vulnerability: 1 }), 2)!.currentLife).toBe(3);
+    });
+    it("structural invariant: the victim gets only one DAMAGE event", () => {
+      const s = hit({});
+      const n = s.log.filter((e) => e.type === "DAMAGE" && (e as { targetInstanceId?: number }).targetInstanceId === 2).length;
+      expect(n).toBe(1); // the real guard against bringing the split back
+      expect(byId(s, 2)!.currentLife).toBe(4);
+    });
   });
   it("#1457 Arakne à Crochets : les AUTRES invocations (2 camps) deviennent inamovibles ; elle l'est via son propre INAMOVIBLE ; aura retirée à sa mort", () => {
     card(1457);

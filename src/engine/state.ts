@@ -84,6 +84,14 @@ export interface CreatureInstance {
   // stripping a property the creature has innately. Owned by withAuras; absent
   // (treated as empty) on a creature no aura ever touched.
   auraProperties?: Set<string>;
+  // Properties currently granted to this creature by its own conditional keywords: conditional
+  // initiative (Tristepin / Zorine #668), BLESSÉ (Grouilleux #309, Edass #43), conditional family
+  // keywords (Korbax #379), seed-conditional keywords (Kolo Kolko). Same bookkeeping as
+  // `auraProperties` and for the same reason: withAuras must revoke ONLY what it granted itself, so
+  // a keyword CONFERRED FROM OUTSIDE (Initiative #464, Ravage #259, Cervelle de Iop #683, Eratz #83)
+  // is never stripped when the carrier's own condition flips. A conferred keyword is permanent.
+  // Owned by withAuras; absent (treated as empty) until it grants something.
+  condProperties?: Set<string>;
   // Transient: this creature's life reached 0 because of DAMAGE (not a Destroy / Sacrifice /
   // capture / transform). Set by the damage handlers, read once by resolveDeathsAndWin to fire
   // the posthumous CONTRE COUP ("qu'elle survive ou non"), then cleared on any survivor. Never

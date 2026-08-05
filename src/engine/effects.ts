@@ -586,7 +586,13 @@ export function applyEffect(
       // the cast target itself is hit by the sibling DamageData; here we hit every other living
       // creature (either camp) sharing any family with the target.
       if (!ctx.targetCell) return;
-      const target = creatures.find((c) => sameCoords(c.position, ctx.targetCell!) && c.currentLife > 0);
+      // The target may have just died from the sibling DamageData, applied right before by
+      // applyEffects. The dead are only removed after the whole pass of effects
+      // (resolveDeathsAndWin), so its body still holds its cell, and we find it to read its family.
+      // The damage is simultaneous, so its death does not cancel the family sweep. Otherwise the
+      // 6 AP spell turns into "N damage" as soon as it kills its target (the 2 other Chachas were left untouched).
+      const target = creatures.find((c) => sameCoords(c.position, ctx.targetCell!) && c.currentLife > 0)
+        ?? creatures.find((c) => sameCoords(c.position, ctx.targetCell!));
       if (!target) return;
       const fams = famsOf(target);
       const amount = (effect as { amount?: number }).amount ?? 0;
@@ -1455,6 +1461,16 @@ export function bumpStat(
   delta: number,
 ): void {
   mutateStat(c, [], field, "add", delta);
+}
+
+// Read a stat by its field name. Exported so that the temporary reversion in rules.ts can
+// measure the delta that was really taken, instead of deriving it again from the effect:
+// mutateStat clamps at 0, so a creature with 1 AT only loses 1 and one with 0 AT loses nothing (Sénilité #1241).
+export function readStat(
+  c: CreatureInstance,
+  field: "attack" | "armor" | "movement" | "range" | "life",
+): number {
+  return STAT_FIELDS[field].read(c);
 }
 
 // Apply a stat change to one creature (the per-creature core, shared by the
@@ -2517,6 +2533,10 @@ function handleSilence(
     c.auraRange = 0;
     c.auraResistance = 0;
     c.auraProperties = new Set<string>();
+    // Silence wipes the properties, so the bookkeeping of the conditional keywords that withAuras
+    // granted must start again from zero. Otherwise the next reconciliation would try to remove bits
+    // that are already gone (and worse, a new grant would wrongly remember them as "already innate").
+    c.condProperties = new Set<string>();
     c.silenced = true; // persistent marker for the UI overlay (flag ⟺ event)
 
     log.push({ type: "FIGHT_OBJECT_SILENCED", instanceId: c.instanceId });

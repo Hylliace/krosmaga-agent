@@ -1,8 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { createInitialState, applyMulligan } from "../engine/rules";
 import { Rng } from "../engine/rng";
-import { determinize } from "./determinize";
+import { determinize, resampleEnemyReals } from "./determinize";
 import type { GameState } from "../engine/state";
+import type { Side } from "../engine/board";
 
 const deckA = Array.from({ length: 30 }, (_, i) => 100 + i);
 const deckB = Array.from({ length: 30 }, (_, i) => 500 + i);
@@ -70,5 +71,51 @@ describe("determinize (information-fair world sampling)", () => {
   it("is reproducible: same state + same seed → identical world", () => {
     const s = midGame();
     expect(determinize(s, "ally", new Rng(123))).toEqual(determinize(s, "ally", new Rng(123)));
+  });
+});
+
+// A living enemy Dofus that has been revealed is public.
+describe("resampleEnemyReals: public information is never drawn again", () => {
+  it("a living revealed enemy Dofus keeps its kind in every world", () => {
+    const base = midGame();
+    const foe: Side = "enemy";
+    // Reveal a real enemy Dofus, its kind is now shown.
+    const revele = base.dofuses.find((d) => d.owner === foe && d.kind === "real")!;
+    const dofuses = base.dofuses.map((d) =>
+      d.position.x === revele.position.x && d.position.y === revele.position.y
+        ? { ...d, revealed: true }
+        : d,
+    );
+    // A hundred sampled worlds with different seeds, and none of them may change
+    // the kind of the revealed Dofus.
+    for (let seed = 1; seed <= 100; seed++) {
+      const out = resampleEnemyReals(dofuses, foe, new Rng(seed));
+      const apres = out.find(
+        (d) => d.position.x === revele.position.x && d.position.y === revele.position.y,
+      )!;
+      expect(apres.kind).toBe("real");
+    }
+  });
+
+  // A safety net, not a proof of the fix: this test also passes without it (the
+  // total is right in both cases, 3 cells out of 5, or 1 known and 2 cells out of
+  // 4). I keep it because the invariant matters, but the test above is the one that
+  // tells the two apart.
+  it("the total number of real enemy Dofus stays exact after a reveal", () => {
+    const base = midGame();
+    const foe: Side = "enemy";
+    const revele = base.dofuses.find((d) => d.owner === foe && d.kind === "real")!;
+    const dofuses = base.dofuses.map((d) =>
+      d.position.x === revele.position.x && d.position.y === revele.position.y
+        ? { ...d, revealed: true }
+        : d,
+    );
+    for (let seed = 1; seed <= 50; seed++) {
+      const out = resampleEnemyReals(dofuses, foe, new Rng(seed));
+      const vrais = out.filter((d) => d.owner === foe && d.kind === "real").length;
+      // The revealed one counts once, not twice. Without the fix it was counted
+      // as known and also put back into the draw.
+      expect(vrais).toBe(3);
+    }
   });
 });
