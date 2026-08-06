@@ -537,6 +537,16 @@ export interface MctsOptions {
   // and expands the top-K actions by prior instead of the heuristic top-K.
   priorFn?: PriorFn;
   cPuct?: number; // PUCT exploration constant (used only when a prior is active)
+  // Sequential halving at the root (Karnin et al. 2013, Danihelka et al. 2022). Only
+  // the final move counts at the root, and UCB1 is not good at that with a small
+  // budget. All the candidates of the pre-sort enter the first phase, each phase
+  // gives the same number of simulations to every survivor and keeps the best half,
+  // ranked by the heuristic score plus a term in the mean value (as in Gumbel MuZero).
+  // Below the root the search is unchanged. Off by default.
+  rootSH?: boolean;
+  shTemp?: number; // temperature of the heuristic logits (score points per nat)
+  shCVisit?: number; // c_visit of the value term (50 in Danihelka et al.)
+  shCScale?: number; // c_scale of the value term (1.0 in Danihelka et al.)
 }
 
 export class MctsAgent implements Agent {
@@ -548,6 +558,10 @@ export class MctsAgent implements Agent {
   private readonly leaf?: LeafEval;
   private readonly prior?: PriorFn;
   private readonly cPuct: number;
+  private readonly rootSH: boolean;
+  private readonly shTemp: number;
+  private readonly shCVisit: number;
+  private readonly shCScale: number;
   // Set for the duration of a searchRootStats call (per-decision overrides, e.g. a
   // net leaf/prior that captured the root belief). Fall back to the ctor versions.
   private activeLeaf?: LeafEval;
@@ -561,7 +575,11 @@ export class MctsAgent implements Agent {
     this.leaf = opts.leafEval;
     this.prior = opts.priorFn;
     this.cPuct = opts.cPuct ?? 1.5;
-    this.name = `MCTS(${this.simulations})`;
+    this.rootSH = opts.rootSH ?? false;
+    this.shTemp = opts.shTemp ?? 150;
+    this.shCVisit = opts.shCVisit ?? 50;
+    this.shCScale = opts.shCScale ?? 1.0;
+    this.name = `MCTS(${this.simulations}${this.rootSH ? "+SH" : ""})`;
   }
 
   // Heuristic prior: with ~50 legal moves, a modest budget cannot search deep
@@ -651,14 +669,98 @@ export class MctsAgent implements Agent {
     this.activePrior = priorFn ?? this.prior;
     const rootSide = actingSide(state);
     const root = this.makeNode(state, null, null, rng);
-    for (let i = 0; i < this.simulations; i++) {
-      this.simulate(root, rootSide, rng);
+    if (this.rootSH && !root.terminal && root.untried.length >= 2) {
+      this.shRootSearch(root, rootSide, rng);
+    } else {
+      for (let i = 0; i < this.simulations; i++) {
+        this.simulate(root, rootSide, rng);
+      }
     }
     // q = mean backed-up value of the child (rootSide's view, in (−1,1)), the search's
     // own judgement of each root action. Exposed for the v2 policy recording (soft π
     // targets and root value, used for the mixed value label that reduces the noise
     // of the final-outcome signal).
     return root.children.map((ch) => ({ action: ch.action!, visits: ch.visits, q: ch.visits > 0 ? ch.value / ch.visits : 0 }));
+  }
+
+  /** Sequential halving at the root. The budget is spent in phases on the pre-sort
+   *  candidates. Each phase visits every survivor the same number of times (the first
+   *  step is forced on the candidate, UCB1 below it), then keeps the best half by
+   *  heuristic logit plus the value term. What is left of the budget goes to the last
+   *  survivor. The visit counts replace those of UCB1, so the aggregation across
+   *  worlds, the veto and the tie-break work as before. */
+  private shRootSearch(root: Node, rootSide: Side, rng: Rng): void {
+    const side = actingSide(root.state);
+    const acts = [...root.untried];
+    // Logits from the one-step heuristic score: l_a = (s_a - s_max) / shTemp, at most 0.
+    const scores = acts.map((a) => this.actionPrior(root.state, a, side));
+    const sMax = Math.max(...scores);
+    const logit = new Map<string, number>();
+    for (let i = 0; i < acts.length; i++) logit.set(JSON.stringify(acts[i]), (scores[i] - sMax) / this.shTemp);
+    let alive = acts;
+    const phases = Math.max(1, Math.ceil(Math.log2(alive.length)));
+    let used = 0;
+    for (let p = 0; p < phases && alive.length > 1 && used < this.simulations; p++) {
+      const per = Math.max(1, Math.floor(this.simulations / (phases * alive.length)));
+      for (const a of alive) {
+        for (let i = 0; i < per && used < this.simulations; i++) {
+          this.simulateThrough(root, a, rootSide, rng);
+          used++;
+        }
+      }
+      // Ranking of the phase: logit + (c_visit + max_b N(b)) * c_scale * mean value.
+      let maxN = 0;
+      for (const a of alive) { const ch = this.rootChild(root, a); if (ch && ch.visits > maxN) maxN = ch.visits; }
+      const ranked = alive
+        .map((a) => {
+          const ch = this.rootChild(root, a);
+          const q = ch && ch.visits > 0 ? ch.value / ch.visits : -1; // not visited (budget used up) = worst
+          return { a, s: (logit.get(JSON.stringify(a)) ?? 0) + (this.shCVisit + maxN) * this.shCScale * q };
+        })
+        .sort((x, y) => y.s - x.s);
+      alive = ranked.slice(0, Math.max(1, Math.ceil(alive.length / 2))).map((r) => r.a);
+    }
+    // What is left after rounding goes deeper on the first survivor.
+    while (used < this.simulations) {
+      this.simulateThrough(root, alive[0], rootSide, rng);
+      used++;
+    }
+  }
+
+  private rootChild(root: Node, a: Action): Node | undefined {
+    const key = JSON.stringify(a);
+    return root.children.find((ch) => JSON.stringify(ch.action) === key);
+  }
+
+  /** One simulation whose FIRST step is forced on the root candidate `a` (the child is
+   *  created on the first visit, pending picks included), with the normal UCB1 descent
+   *  below it and the usual evaluation and backup. */
+  private simulateThrough(root: Node, a: Action, rootSide: Side, rng: Rng): void {
+    let node = this.rootChild(root, a);
+    if (!node) {
+      const idx = root.untried.findIndex((u) => JSON.stringify(u) === JSON.stringify(a));
+      if (idx >= 0) root.untried.splice(idx, 1);
+      node = this.makeNode(applyAction(root.state, a), root, a, rng);
+      if (root.priorMap) node.prior = root.priorMap.get(JSON.stringify(a)) ?? 0;
+      root.children.push(node);
+    } else {
+      // Normal descent inside the subtree of the candidate.
+      while (!node.terminal && node.untried.length === 0 && node.children.length > 0) {
+        node = this.selectChild(node, rootSide);
+      }
+      if (!node.terminal && node.untried.length > 0) {
+        node = this.expandOne(node, rng);
+      }
+    }
+    // Same rule as simulate(): a net leaf never scores a state with a pending pick.
+    for (let hops = 0; this.activeLeaf && node.state.pendingAction && !node.terminal && node.untried.length > 0 && hops < 8; hops++) {
+      node = this.expandOne(node, rng);
+    }
+    const value = this.leafValue(node.state, rootSide);
+    for (let n: Node | null = node; n !== null; n = n.parent) {
+      n.visits += 1;
+      n.value += value;
+    }
   }
 
   /** Expand one untried action of `node` into a new child and return it. */

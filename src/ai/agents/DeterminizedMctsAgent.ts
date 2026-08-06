@@ -58,6 +58,11 @@ export interface DetMctsOptions extends MctsOptions {
   // replaying the same lines (shared-blind-spot collapse). Seeded rng only, so
   // games stay reproducible. Never set in arenas or production (default = greedy).
   explore?: { turns: number; temperature?: number };
+  // Cheating agent, for measurement only: every world is the real state (the
+  // opponent hand and the real Dofus are visible) and nothing is hidden at the root.
+  // Playing it against the normal agent at the same budget bounds what any better
+  // belief model could gain. Never used to play or to generate data.
+  cheat?: boolean;
 }
 
 export class DeterminizedMctsAgent implements Agent {
@@ -72,6 +77,7 @@ export class DeterminizedMctsAgent implements Agent {
   private readonly explore?: { turns: number; temperature?: number };
   private readonly vetoMargin?: number;
   private readonly oppModel: boolean;
+  private readonly cheat: boolean;
 
   constructor(opts: DetMctsOptions = {}) {
     this.worlds = opts.worlds ?? 6;
@@ -86,7 +92,8 @@ export class DeterminizedMctsAgent implements Agent {
     this.explore = opts.explore;
     this.vetoMargin = opts.vetoMargin;
     this.oppModel = opts.oppModel ?? true;
-    const tag = (opts.makeLeafEval ? "+v" : "") + (opts.makePriorFn ? "+p" : "") || (opts.belief ? "+belief" : "");
+    this.cheat = opts.cheat ?? false;
+    const tag = ((opts.makeLeafEval ? "+v" : "") + (opts.makePriorFn ? "+p" : "") || (opts.belief ? "+belief" : "")) + (opts.cheat ? "+cheat" : "") + (opts.rootSH ? "+SH" : "");
     this.name = `DetMCTS(${this.worlds}x${opts.simulations ?? 80}${tag}${opts.explore ? `+x${opts.explore.turns}` : ""})`;
   }
 
@@ -151,7 +158,7 @@ export class DeterminizedMctsAgent implements Agent {
     // blinded state instead: enemy Dofus kinds are re-sampled with a deterministic
     // per-decision seed shared by every candidate, the same information the search
     // has in its own determinized worlds.
-    const blind = blindFoeDofuses(state);
+    const blind = this.cheat ? state : blindFoeDofuses(state); // the cheater keeps the real state here too
     // Root sanity veto: drop root actions that the one-step heuristic rates far below
     // the best-scored root action. The 85% tie-break below only decides near-ties, so
     // a value net that strongly preferred a line that does nothing (charging the
@@ -210,7 +217,7 @@ export class DeterminizedMctsAgent implements Agent {
     // q pooled across worlds VISIT-WEIGHTED (qSum accumulates q×visits).
     const votes = new Map<string, { action: Action; visits: number; qSum: number }>();
     for (let w = 0; w < this.worlds; w++) {
-      const world = this.belief ? determinizeBelief(state, me, this.belief, rng) : determinize(state, me, rng);
+      const world = this.cheat ? state : this.belief ? determinizeBelief(state, me, this.belief, rng) : determinize(state, me, rng);
       for (const s of this.inner.searchRootStats(world, rng, leafEval, priorFn)) {
         const key = JSON.stringify(s.action);
         const cur = votes.get(key);

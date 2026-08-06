@@ -79,9 +79,13 @@ async function main(): Promise<void> {
   if (SELF) {
     // Same evaluator both sides; the only difference is the search budget.
     // "net" (the win% we report) = side A = the deep budget; "base" = B = shallow.
-    net = new DeterminizedMctsAgent({ ...common, makeLeafEval: valueLeaf });
+    // --cheat-a: side A cheats (worlds are the real state). --sh-a: side A runs
+    // sequential halving at the root. Both are for measurement only.
+    const CHEAT_A = process.argv.includes("--cheat-a");
+    const SH_A = process.argv.includes("--sh-a");
+    net = new DeterminizedMctsAgent({ ...common, makeLeafEval: valueLeaf, cheat: CHEAT_A, rootSH: SH_A });
     base = new DeterminizedMctsAgent({ worlds: WORLDS_B, simulations: SIMS_B, maxBranch: MAXBRANCH_B, belief: corpusMap, makeLeafEval: valueLeaf });
-    label = `value(${MODEL}) SELF-GAP ${WORLDS}x${SIMS} (deep) vs ${WORLDS_B}x${SIMS_B} (shallow)`;
+    label = `value(${MODEL}) SELF-GAP ${WORLDS}x${SIMS}${CHEAT_A ? " CHEAT" : ""}${SH_A ? " SH" : ""} (A) vs ${WORLDS_B}x${SIMS_B} (B)`;
   } else if (MODEL_B) {
     const modelB = loadTsValueModel(MODEL_B);
     net = new DeterminizedMctsAgent({ ...common, makeLeafEval: valueLeaf });
