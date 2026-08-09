@@ -29,7 +29,7 @@ import type { Action } from "../actions";
 import { actingSide, legalActions, applyAction, declineCell } from "../actions";
 import { validPendingTargets, resolvePendingAction, conditionMet, MAX_HAND } from "../../engine/rules";
 import { effectRequiresTarget } from "../../engine/effects";
-import { evaluate, EVAL_WEIGHTS, ownDofusSubscore, dofusProgress, turnsToReach } from "../eval";
+import { evaluate, EVAL_WEIGHTS, ownDofusSubscore, dofusProgress, foeMassSubscore, turnsToReach } from "../eval";
 import { getCard } from "../../engine/cardRegistry";
 
 const END_TURN: Action = { kind: "endTurn" };
@@ -70,12 +70,13 @@ function opponentPassRollout(s: GameState): GameState {
 // per candidate action of the same state.
 const passBaselineCache = new WeakMap<GameState, GameState>();
 const passBaselineCacheOpp = new WeakMap<GameState, GameState>();
-function passBaseline(state: GameState, oppModel = false): GameState {
-  const cache = oppModel ? passBaselineCacheOpp : passBaselineCache;
+const passBaselineCacheOpp2 = new WeakMap<GameState, GameState>(); // portfolio of opponent policies (oppK >= 2)
+function passBaseline(state: GameState, oppModel = false, oppK = 1): GameState {
+  const cache = oppModel ? (oppK >= 2 ? passBaselineCacheOpp2 : passBaselineCacheOpp) : passBaselineCache;
   const hit = cache.get(state);
   if (hit) return hit;
   const myEnd = settleHops(applyAction(state, END_TURN));
-  const b = oppModel ? opponentModelRollout(myEnd) : opponentPassRollout(myEnd);
+  const b = oppModel ? worstOppBoard(myEnd, actingSide(state), oppK) : opponentPassRollout(myEnd);
   cache.set(state, b);
   return b;
 }
@@ -89,12 +90,32 @@ function passBaseline(state: GameState, oppModel = false): GameState {
  *  shallow score from its own point of view (reusing completeTurnGreedy from rule
  *  10, 3 plies at most), then its end of turn. It only runs at the root (veto and
  *  tie-break). Can be switched per agent (oppModel option) for on/off A/B tests. */
-function opponentModelRollout(s: GameState): GameState {
+function opponentModelRollout(s: GameState, intent: OppIntent = "balanced"): GameState {
   if (s.winner !== null || s.pendingAction || s.mulligan) return s;
   const foe = actingSide(s);
-  const played = completeTurnGreedy(s, foe, 3);
+  const played = completeTurnGreedy(s, foe, 3, intent);
   if (played.winner !== null || played.pendingAction) return played;
   return settleHops(applyAction(played, END_TURN));
+}
+
+/** Portfolio of opponent continuations (as in Modicum, Brown et al. 2018). With
+ *  oppK = 1 the rollout assumes one opponent, the balanced greedy completion. With
+ *  oppK = 2 a rush completion is added (the Dofus term weighs more in its greedy
+ *  choice), with oppK = 3 a control completion too (it goes after my creatures
+ *  first), and the board kept is the worst one for `side`, so my move has to be good
+ *  against each of them. It costs oppK times more deep rollouts, at the root only. */
+type OppIntent = "balanced" | "rush" | "control";
+export function worstOppBoard(myEnd: GameState, side: Side, oppK: number): GameState {
+  let worst = opponentModelRollout(myEnd);
+  if (oppK < 2) return worst;
+  let worstE = evaluate(worst, side);
+  const intents: OppIntent[] = oppK >= 3 ? ["rush", "control"] : ["rush"];
+  for (const it of intents) {
+    const b = opponentModelRollout(myEnd, it);
+    const e = evaluate(b, side);
+    if (e < worstE) { worst = b; worstE = e; }
+  }
+  return worst;
 }
 
 // Rule 13 v2: the short pass probe (my end of turn without playing and without the
@@ -116,16 +137,31 @@ function shallowPassProbe(state: GameState): GameState {
  *  greedily (each step picked by the shallow one-step score), and a root candidate
  *  is judged by the whole turn it starts. Since this is planned again at every
  *  real decision, the greedy completion settles on the right order. */
-function completeTurnGreedy(start: GameState, side: Side, maxPlies = 5): GameState {
+function completeTurnGreedy(start: GameState, side: Side, maxPlies = 5, intent: OppIntent = "balanced"): GameState {
   let cur = start;
   for (let ply = 0; ply < maxPlies; ply++) {
     if (cur.winner !== null || cur.mulligan || cur.pendingAction || actingSide(cur) !== side) break;
     const acts = legalActions(cur).filter((x) => x.kind !== "endTurn");
     if (acts.length === 0) break;
+    // Rush intent: the Dofus term weighs more in the greedy choice. Only the change
+    // during the turn is counted, since the advance at the end of the turn is the
+    // same for every continuation. The end of turn score is not biased, so the bias
+    // changes the order of the moves, not when to stop.
+    const progBase = intent === "rush" ? dofusProgress(cur, side) : 0;
+    // Control intent: same idea, with the mass of my creatures that the opponent
+    // tries to remove.
+    const massBase = intent === "control" ? foeMassSubscore(cur, side) : 0;
     let best: Action | null = null;
     let bestScore = oneStepHeuristicScore(cur, END_TURN, side); // continuing must beat stopping
     for (const x of acts) {
-      const sc = oneStepHeuristicScore(cur, x, side);
+      let sc = oneStepHeuristicScore(cur, x, side);
+      if (intent === "rush") {
+        const mid = settleHops(applyAction(cur, x));
+        sc += EVAL_WEIGHTS.oppRushBias * (dofusProgress(mid, side) - progBase);
+      } else if (intent === "control") {
+        const mid = settleHops(applyAction(cur, x));
+        sc += EVAL_WEIGHTS.oppControlBias * (massBase - foeMassSubscore(mid, side));
+      }
       if (sc > bestScore) { bestScore = sc; best = x; }
     }
     if (!best) break;
@@ -134,7 +170,7 @@ function completeTurnGreedy(start: GameState, side: Side, maxPlies = 5): GameSta
   return cur;
 }
 
-export function oneStepHeuristicScore(state: GameState, a: Action, side: Side, deep = false, plan = false, oppModel = false): number {
+export function oneStepHeuristicScore(state: GameState, a: Action, side: Side, deep = false, plan = false, oppModel = false, oppK = 1): number {
   let after = applyAction(state, a);
   // Rule 7 (e.g. Glaie #126 played alone on turn 2): an APPARITION pick whose only
   // valid target is the summon itself (or nothing at all) cannot put its effect
@@ -211,7 +247,7 @@ export function oneStepHeuristicScore(state: GameState, a: Action, side: Side, d
   // AP you have; cashing the reserve and passing is twice as wasteful, since the
   // banked AP would have stayed).
   if (a.kind === "endTurn") {
-    const board = deep ? (oppModel ? opponentModelRollout(after) : opponentPassRollout(after)) : after;
+    const board = deep ? (oppModel ? worstOppBoard(after, side, oppK) : opponentPassRollout(after)) : after;
     // Rule 27: ending your own turn with a full hand burns next turn's draw.
     const burn = state.players[side].hand.length >= MAX_HAND ? EVAL_WEIGHTS.handFullBurn : 0;
     return evaluate(board, side) - EVAL_WEIGHTS.wastedAp * state.players[side].ap - burn;
@@ -222,7 +258,7 @@ export function oneStepHeuristicScore(state: GameState, a: Action, side: Side, d
   // Rule 10: judge the candidate by the whole turn it starts (root plan mode).
   if (plan) after = completeTurnGreedy(after, side);
   const myEnd = settleHops(applyAction(after, END_TURN));
-  const board = deep ? (oppModel ? opponentModelRollout(myEnd) : opponentPassRollout(myEnd)) : myEnd;
+  const board = deep ? (oppModel ? worstOppBoard(myEnd, side, oppK) : opponentPassRollout(myEnd)) : myEnd;
   let score = evaluate(board, side) - EVAL_WEIGHTS.wastedAp * after.players[side].ap;
   // Rule 27: if the action line still ends with a full hand, the next draw burns,
   // same penalty.
@@ -234,7 +270,7 @@ export function oneStepHeuristicScore(state: GameState, a: Action, side: Side, d
   // pending states have no pass baseline.
   if (deep && state.pendingAction === null) {
     const ownAction = ownDofusSubscore(board, side);
-    const ownPass = ownDofusSubscore(passBaseline(state, oppModel), side);
+    const ownPass = ownDofusSubscore(passBaseline(state, oppModel, oppK), side);
     if (ownAction < ownPass) score -= EVAL_WEIGHTS.dofusAccel * (ownPass - ownAction);
   }
   // Rule 3, stricter: cashing the reserve is only worth it when it unlocks a play

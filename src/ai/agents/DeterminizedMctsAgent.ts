@@ -58,6 +58,10 @@ export interface DetMctsOptions extends MctsOptions {
   // replaying the same lines (shared-blind-spot collapse). Seeded rng only, so
   // games stay reproducible. Never set in arenas or production (default = greedy).
   explore?: { turns: number; temperature?: number };
+  // Size of the portfolio of opponent policies in the deep rollout (1 = the balanced
+  // completion only, 2 = plus a rush, 3 = plus a control intent, the worst board is
+  // kept). Default 1.
+  oppK?: number;
   // Cheating agent, for measurement only: every world is the real state (the
   // opponent hand and the real Dofus are visible) and nothing is hidden at the root.
   // Playing it against the normal agent at the same budget bounds what any better
@@ -78,6 +82,7 @@ export class DeterminizedMctsAgent implements Agent {
   private readonly vetoMargin?: number;
   private readonly oppModel: boolean;
   private readonly cheat: boolean;
+  private readonly oppK: number;
 
   constructor(opts: DetMctsOptions = {}) {
     this.worlds = opts.worlds ?? 6;
@@ -93,6 +98,7 @@ export class DeterminizedMctsAgent implements Agent {
     this.vetoMargin = opts.vetoMargin;
     this.oppModel = opts.oppModel ?? true;
     this.cheat = opts.cheat ?? false;
+    this.oppK = opts.oppK ?? 1;
     const tag = ((opts.makeLeafEval ? "+v" : "") + (opts.makePriorFn ? "+p" : "") || (opts.belief ? "+belief" : "")) + (opts.cheat ? "+cheat" : "") + (opts.rootSH ? "+SH" : "");
     this.name = `DetMCTS(${this.worlds}x${opts.simulations ?? 80}${tag}${opts.explore ? `+x${opts.explore.turns}` : ""})`;
   }
@@ -164,7 +170,7 @@ export class DeterminizedMctsAgent implements Agent {
     // a value net that strongly preferred a line that does nothing (charging the
     // opponent's creature for nothing, a spell with zero effect) used to get through.
     // Also applied to exploration sampling, since there is no reason to learn bad lines.
-    const stats = vetoByHeuristic(blind, statsIn, this.vetoMargin, this.oppModel);
+    const stats = vetoByHeuristic(blind, statsIn, this.vetoMargin, this.oppModel, this.oppK);
     if (this.explore && state.turn <= this.explore.turns) {
       const pick = this.sampleByVisits(stats, this.explore.temperature ?? 1, rng);
       if (pick) return pick;
@@ -182,7 +188,7 @@ export class DeterminizedMctsAgent implements Agent {
     const me = actingSide(state);
     let best: { action: Action; score: number } | null = null;
     for (const v of near) {
-      const score = oneStepHeuristicScore(blind, v.action, me, true, true, this.oppModel); // rules 8+10 sur l'état AVEUGLÉ (info-fairness)
+      const score = oneStepHeuristicScore(blind, v.action, me, true, true, this.oppModel, this.oppK); // rules 8+10 sur l'état AVEUGLÉ (info-fairness)
       if (!best || score > best.score || (score === best.score && rng.next() < 0.5)) best = { action: v.action, score };
     }
     return best!.action;
@@ -237,11 +243,11 @@ export class DeterminizedMctsAgent implements Agent {
  *  and are vetoed however hard the value net pushes them. Pure and exported for
  *  the sanity tests. Never returns an empty list (the heuristic-best action
  *  always survives). */
-export function vetoByHeuristic<T extends { action: Action }>(state: GameState, stats: T[], margin?: number, oppModel = false): T[] {
+export function vetoByHeuristic<T extends { action: Action }>(state: GameState, stats: T[], margin?: number, oppModel = false, oppK = 1): T[] {
   if (stats.length <= 1) return stats;
   const me = actingSide(state);
   const m = margin ?? EVAL_WEIGHTS.rootVeto;
-  const scored = stats.map((s) => ({ s, h: oneStepHeuristicScore(state, s.action, me, true, true, oppModel) })); // rules 8+10: same metric as the tie-break (deep+plan); a veto judged at a shorter horizon could veto the plan-best action
+  const scored = stats.map((s) => ({ s, h: oneStepHeuristicScore(state, s.action, me, true, true, oppModel, oppK) })); // rules 8+10: same metric as the tie-break (deep+plan); a veto judged at a shorter horizon could veto the plan-best action
   let hBest = -Infinity;
   for (const e of scored) if (e.h > hBest) hBest = e.h;
   const kept = scored.filter((e) => e.h >= hBest - m).map((e) => e.s);

@@ -183,6 +183,14 @@ export const EVAL_WEIGHTS = {
   // even an average card, beats burning a draw. 40 = one hand card (32) plus the lost
   // option, sized to outweigh the keep margin of rule 4.
   handFullBurn: 40,
+  // Portfolio of opponent policies: weight added to the Dofus term in the greedy
+  // completion of a rush opponent. With 1.5 the Dofus term counts 2.5 times its
+  // normal weight in the choice of the rush, enough to push its moves towards
+  // pressure without hiding the rest of the score.
+  oppRushBias: 1.5,
+  // Same for a control opponent, on the mass of my creatures. Same dose as the rush,
+  // it pushes the moves towards removals and trades.
+  oppControlBias: 1.5,
 };
 
 const REAL_PER_SIDE = 3;
@@ -306,6 +314,30 @@ function dofusScore(state: GameState, side: Side, W: typeof EVAL_WEIGHTS): numbe
   s += W.fakeDestroyed * (enemyFakesDestroyed - myFakesLost);
   s -= W.ownFakeDamage * myFakeDamage;
   return s;
+}
+
+/** Mass of the creatures of the other side: weighted sum of the living enemy bodies
+ *  (stats and mobility, with the same discount for a dead lane as the evaluation).
+ *  Used by the control intent of the opponent portfolio, an opponent that tries to
+ *  clear my board before going for the Dofus. The value is positive and goes down
+ *  when my creatures die, and the control intent tries to make it small. */
+export function foeMassSubscore(state: GameState, side: Side): number {
+  const W = EVAL_WEIGHTS;
+  const lanesWithAllyDofus = new Set<number>();
+  const lanesWithEnemyDofus = new Set<number>();
+  for (const d of state.dofuses) {
+    if (d.currentLife <= 0) continue;
+    if (d.owner === "ally") lanesWithAllyDofus.add(d.position.y);
+    else lanesWithEnemyDofus.add(d.position.y);
+  }
+  let mass = 0;
+  for (const c of state.creatures) {
+    if (c.currentLife <= 0 || c.owner === side) continue;
+    const targetLanes = c.owner === "ally" ? lanesWithEnemyDofus : lanesWithAllyDofus;
+    const bodyMult = targetLanes.has(c.position.y) ? 1 : W.deadLaneBody;
+    mass += bodyMult * (W.boardStat * (c.currentAttack + c.currentLife + c.armor) + W.mobility * c.baseMovement);
+  }
+  return mass;
 }
 
 /** Rule 9 helper: my own Dofus health as a (non-positive) subscore, priced with

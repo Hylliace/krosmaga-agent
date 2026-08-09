@@ -83,9 +83,11 @@ async function main(): Promise<void> {
     // sequential halving at the root. Both are for measurement only.
     const CHEAT_A = process.argv.includes("--cheat-a");
     const SH_A = process.argv.includes("--sh-a");
-    net = new DeterminizedMctsAgent({ ...common, makeLeafEval: valueLeaf, cheat: CHEAT_A, rootSH: SH_A });
+    // --oppk-a N: size of the portfolio of opponent policies for side A.
+    const OPPK_A = parseInt(arg("--oppk-a", "1"), 10);
+    net = new DeterminizedMctsAgent({ ...common, makeLeafEval: valueLeaf, cheat: CHEAT_A, rootSH: SH_A, oppK: OPPK_A });
     base = new DeterminizedMctsAgent({ worlds: WORLDS_B, simulations: SIMS_B, maxBranch: MAXBRANCH_B, belief: corpusMap, makeLeafEval: valueLeaf });
-    label = `value(${MODEL}) SELF-GAP ${WORLDS}x${SIMS}${CHEAT_A ? " CHEAT" : ""}${SH_A ? " SH" : ""} (A) vs ${WORLDS_B}x${SIMS_B} (B)`;
+    label = `value(${MODEL}) SELF-GAP ${WORLDS}x${SIMS}${CHEAT_A ? " CHEAT" : ""}${SH_A ? " SH" : ""}${OPPK_A > 1 ? ` oppK${OPPK_A}` : ""} (A) vs ${WORLDS_B}x${SIMS_B} (B)`;
   } else if (MODEL_B) {
     const modelB = loadTsValueModel(MODEL_B);
     net = new DeterminizedMctsAgent({ ...common, makeLeafEval: valueLeaf });
