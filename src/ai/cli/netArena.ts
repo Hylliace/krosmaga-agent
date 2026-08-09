@@ -137,15 +137,28 @@ async function main(): Promise<void> {
     base = new DeterminizedMctsAgent({ ...common });
     label = "net(value) vs heuristic";
   }
-  console.log(`held-out ${held.length} decks (fold ${FOLD}); ${label}, DetMCTS(${WORLDS}x${SIMS}), ${GAMES} games`);
+  const PAIRED = process.argv.includes("--paired");
+  console.log(`held-out ${held.length} decks (fold ${FOLD}); ${label}, DetMCTS(${WORLDS}x${SIMS}), ${GAMES} games${PAIRED ? " (paired: " + (GAMES >> 1) + " deals x2)" : ""}`);
 
   const sampler = new CorpusSampler(held);
   const sampleRng = new Rng((SEED ^ 0x51ed) | 0);
   let netWins = 0, decided = 0, draws = 0, errors = 0;
   const t0 = Date.now();
 
+  // --paired: duplicate scoring, as in bridge. Without it every game draws a new
+  // matchup and a new seed, and the variance of the draw (which deck against which,
+  // which hands) is larger than the difference between the two agents. This is why
+  // gains of about 5 points over 300 games went away on new seeds. Here every
+  // matchup is played twice, with the same decks and the same seed and the agents
+  // swapped. A matchup that favors one deck gives one win to each side and counts
+  // exactly 50%, so only what the agents do differently from the same position is
+  // left in the score. It detects smaller differences with the same number of games.
+  let pairM: ReturnType<typeof sampler.matchup> | null = null;
   for (let i = 0; i < GAMES; i++) {
-    const m = sampler.matchup(sampleRng, { alpha: 1 });
+    // Paired: one draw per pair (even i), reused by the mirror game (odd i), and
+    // the game seed is the seed of the pair.
+    const m = PAIRED ? (i % 2 === 0 ? (pairM = sampler.matchup(sampleRng, { alpha: 1 })) : pairM!) : sampler.matchup(sampleRng, { alpha: 1 });
+    const gameSeed = SEED + (PAIRED ? i >> 1 : i);
     const netIsAlly = i % 2 === 0; // alternate sides to cancel first/second bias
     const agentA = netIsAlly ? net : base;
     const agentB = netIsAlly ? base : net;
@@ -156,14 +169,14 @@ async function main(): Promise<void> {
     let raw;
     try {
       raw = recordGameRaw(agentA, agentB, {
-        decks: { ally: m.ally.cards, enemy: m.enemy.cards }, seed: SEED + i, firstSide: m.firstSide,
+        decks: { ally: m.ally.cards, enemy: m.enemy.cards }, seed: gameSeed, firstSide: m.firstSide,
         gods: { ally: m.ally.god, enemy: m.enemy.god }, maxTurns: 200, maxPlies: 1500, mu,
       });
     } catch (e) {
       // One broken game (engine invariant / netLeaf tripwire) costs one game,
       // not the whole arena. Loud in the log so it still gets investigated.
       errors++;
-      console.warn(`\n[ERROR] seed=${SEED + i} ${m.ally.god} vs ${m.enemy.god}: ${e instanceof Error ? e.message.split("\n")[0] : e} -> SKIPPED`);
+      console.warn(`\n[ERROR] seed=${gameSeed} ${m.ally.god} vs ${m.enemy.god}: ${e instanceof Error ? e.message.split("\n")[0] : e} -> SKIPPED`);
       continue;
     }
     if (!raw || raw.res.w === 0) { draws++; continue; }
