@@ -60,6 +60,13 @@ export class TsValueModel {
 
   /** Pre-tanh value (unbounded). Parity vs PyTorch is checked here. */
   logit(x: ArrayLike<number>): number {
+    // Shape guard: without it, an encoding from another layout is read without any
+    // complaint (shifted planes, globals read from the middle of the planes, shifted
+    // V-vectors) and gives a plausible but wrong score. An agent that is silently
+    // broken is much worse than an exception.
+    if (x.length !== this.encLen) {
+      throw new Error(`TsValueModel: input of ${x.length} columns, ${this.encLen} expected, the encoding layout does not match this model`);
+    }
     const C = this.channels;
 
     // planes (C0 = nPlanes, 5×10) → conv stem → BN → ReLU. The raw encoding is

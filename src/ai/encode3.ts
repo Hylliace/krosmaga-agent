@@ -203,7 +203,9 @@ export function encode3(state: GameState, me: Side, ctx: EncodeCtx3): Float32Arr
     set(`${pre}_cost`, y, x, (creatureCost(c) + (c.playedCostMod ?? 0)) / 10);
     for (const p of PROPERTIES3) if (c.properties.has(p)) set(`${pre}_prop_${p}`, y, x, 1);
     // Instance-snapshotted triggers (silence strips them → reflected here).
-    for (const t of c.triggers) set(`${pre}_trig_${t.trigger}`, y, x, 1);
+    // Guarded like the families: otherwise a trigger missing from the registry would be
+    // dropped silently (set() on an unknown name writes at index NaN, a no-op).
+    for (const t of c.triggers) if (PLANE_IDX.has(`${pre}_trig_${t.trigger}`)) set(`${pre}_trig_${t.trigger}`, y, x, 1);
     for (const f of famsOf(c)) if (PLANE_IDX.has(`${pre}_fam_${f}`)) set(`${pre}_fam_${f}`, y, x, 1);
     const power = c.currentAttack + c.currentLife / 2;
     if (mine) myLanePower[y] += power;

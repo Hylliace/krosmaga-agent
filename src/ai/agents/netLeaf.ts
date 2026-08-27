@@ -31,7 +31,8 @@ import { resolvePendingAction, validPendingTargets } from "../../engine/rules";
 import { actingSide, declineCell } from "../actions";
 import { evaluate } from "../eval";
 import { encode2, encodingLength2, type EncodeCtx2 } from "../encode2";
-import { encode3, encodingLength3 } from "../encode3";
+import { encode3, encodingLength3, N_PLANES3, vocabSizeOf3 } from "../encode3";
+import { LAYOUTS, projectToLayout } from "../enc/legacyLayout";
 import type { TsValueModel } from "../net/TsValueModel";
 import type { LeafEval } from "./MctsAgent";
 
@@ -85,6 +86,12 @@ export function netLeafEvalFactory(
 ): (rootState: GameState, me: Side) => LeafEval {
   const v2len = encodingLength2(cardIndex);
   const v3len = encodingLength3(cardIndex);
+  // Inherited layout: PLANES3 comes from the observation registry, so any entry
+  // added to the registry (for example "Saoul" for the Pandawa god) widens the
+  // vector and makes a network trained before unreadable. A model that declares the
+  // old length is now served through a projection onto its training layout,
+  // instead of crashing the search. When the registry has not moved, the frozen
+  // layout is the current layout and the direct branch applies (no cost).
   return (rootState, me) => {
     // One belief per perspective, both from public info only: beliefs[s] is what
     // side s cannot see about its opponent. Built once per decision.
@@ -104,10 +111,15 @@ export function netLeafEvalFactory(
       }
       const side = actingSide(p); // the receiver: fresh AP, about to play, the training distribution
       const ctx: EncodeCtx2 = { cardIndex, belief: beliefs[side] };
+      // Route by layout identity (the number of planes the model declares), not by
+      // length: the length alone does not say which planes the network expects.
+      // TsValueModel then checks the exact shape of the vector.
+      const target = LAYOUTS.get(model.nPlanes);
       const x =
-        model.encLen === v3len ? encode3(p, side, ctx) :
+        model.nPlanes === N_PLANES3 ? encode3(p, side, ctx) :
+        target ? projectToLayout(encode3(p, side, ctx), target, vocabSizeOf3(cardIndex)) :
         model.encLen === v2len ? encode2(p, side, ctx) :
-        (() => { throw new Error(`netLeaf: model enc_len ${model.encLen} matches neither v2 (${v2len}) nor v3 (${v3len})`); })();
+        (() => { throw new Error(`netLeaf: model with ${model.nPlanes} planes / ${model.encLen} columns, no known layout (current v3 ${v3len} with ${N_PLANES3} planes, frozen ${[...LAYOUTS.keys()].join("/")}, v2 ${v2len})`); })();
       const v = model.value(x);
       // The net answers "does the ENCODED side win?"; selectChild wants the
       // value from rootSide's perspective.
