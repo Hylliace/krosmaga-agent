@@ -2,7 +2,7 @@
 // probes, add a new `it(...)` block per spell and `npm test` re-verifies
 // everything in milliseconds.
 import { describe, it, expect } from "vitest";
-import { card, mkCreature, scenario, byId } from "./testkit";
+import { card, cards, mkCreature, scenario, byId } from "./testkit";
 import { Rng } from "./rng";
 import { playCard, endTurn, startTurn, canPlayCard, drawCard, resolvePendingAction, cancelPendingAction, validPendingTargets, runTrigger, claimReserve, plantSeed, seedPlantCost, resolveDeathsAndWin, withAuras, fireContreCoup, createInitialState, applyMulligan, effectiveCost, creatureCost, MAX_HAND } from "./rules";
 import type { DofusInstance, GameEvent } from "./state";
@@ -1733,7 +1733,11 @@ describe("Mur (wall placement + immobility)", () => {
     expect([...xs].every((x) => x >= 5 && x <= 8)).toBe(true);
   });
   it("Silence keeps the Mur (Statue) but strips other abilities", () => {
-    const wall = mkCreature(80, "ally", { x: 6, y: 2 }, { properties: new Set(["Statue", "Shield"]), resistance: 1 });
+    // The Wall kept is the one printed on the card: #23 Arbre à Chachas carries "Statue" in
+    // card.properties. A synthetic creature whose card declares no Wall keeps nothing of it,
+    // which is intended since silence turns a creature into a vanilla one.
+    card(23);
+    const wall = mkCreature(80, "ally", { x: 6, y: 2 }, { cardId: 23, properties: new Set(["Statue", "Shield"]), resistance: 1 });
     let s = scenario([wall], 220);
     s = playCard(s, card(220), { x: 0, y: 0 });
     expect(byId(s, 80)!.properties.has("Statue")).toBe(true);
@@ -1919,18 +1923,50 @@ describe("Portée (range system)", () => {
     bumpStat(shooter, "range", 2);
     expect(shooter.range).toBe(4); // 2 → 4 (un vrai tireur est bien boosté)
   });
-  it("#1217 Empaleur Embusqué: APPARITION → vulnérabilité 1 aux ennemis SI sous-nombre", () => {
+  it("#1217 Empaleur Embusqué: a continuous aura, not an APPARITION", () => {
+    // The text carries no trigger keyword, so it is a continuous ability, recomputed by withAuras.
+    // Before: a permanent one-shot at its placement, the condition tested only once, the
+    // vulnerability never removed, and enemies that arrived later never hit.
     card(1217);
-    const emp = mkCreature(205, "ally", { x: 8, y: 2 }, { cardId: 1217, triggers: card(1217).triggers ?? [] });
-    const e1 = mkCreature(206, "enemy", { x: 3, y: 2 }, {});
-    const e2 = mkCreature(207, "enemy", { x: 3, y: 0 }, {});
-    const s = runTrigger(scenario([emp, e1, e2]), "APPARITION", 205); // 1 allié vs 2 ennemis → sous-nombre
-    expect(byId(s, 206)!.vulnerability).toBe(1);
-    expect(byId(s, 207)!.vulnerability).toBe(1);
-    // pas en sous-nombre → rien
-    const emp2 = mkCreature(205, "ally", { x: 8, y: 2 }, { cardId: 1217, triggers: card(1217).triggers ?? [] });
-    const s2 = runTrigger(scenario([emp2, mkCreature(208, "ally", { x: 7, y: 2 }, {}), mkCreature(206, "enemy", { x: 3, y: 2 }, {})]), "APPARITION", 205);
-    expect(byId(s2, 206)!.vulnerability ?? 0).toBe(0);
+    const emp = () => mkCreature(1, "ally", { x: 8, y: 2 }, { cardId: 1217, currentLife: 4, baseLife: 4, range: 3 });
+    const foe = (id: number, y = 1) => mkCreature(id, "enemy", { x: 3, y }, {});
+    // 1 ally vs 2 enemies, so outnumbered: both enemies are vulnerable
+    const a = withAuras([emp(), foe(2), foe(3, 3)]);
+    expect(a.find((c) => c.instanceId === 2)!.vulnerability).toBe(1);
+    expect(a.find((c) => c.instanceId === 3)!.vulnerability).toBe(1);
+    expect(a.find((c) => c.instanceId === 1)!.vulnerability).toBe(0); // never its own allies
+    // no longer outnumbered, so the aura goes away (that was the main bug)
+    const b = withAuras([...a, mkCreature(4, "ally", { x: 7, y: 0 }, {}), mkCreature(5, "ally", { x: 7, y: 4 }, {})]);
+    expect(b.find((c) => c.instanceId === 2)!.vulnerability).toBe(0);
+  });
+
+  it("#1217: an enemy that arrives later gets the aura, and it goes away when the carrier dies", () => {
+    card(1217);
+    const emp = mkCreature(1, "ally", { x: 8, y: 2 }, { cardId: 1217, currentLife: 4, baseLife: 4, range: 3 });
+    const a = withAuras([emp, mkCreature(2, "enemy", { x: 3, y: 1 }, {}), mkCreature(3, "enemy", { x: 3, y: 3 }, {})]);
+    const nouveau = mkCreature(9, "enemy", { x: 2, y: 0 }, {}); // arrives later
+    const b = withAuras([...a, nouveau]);
+    expect(b.find((c) => c.instanceId === 9)!.vulnerability).toBe(1);
+    const mort = withAuras(b.map((c) => (c.instanceId === 1 ? { ...c, currentLife: 0 } : c)));
+    expect(mort.find((c) => c.instanceId === 9)!.vulnerability).toBe(0);
+  });
+
+  it("#1217 silenced gives nothing any more", () => {
+    card(1217);
+    const emp = mkCreature(1, "ally", { x: 8, y: 2 }, { cardId: 1217, currentLife: 4, baseLife: 4, range: 3, silenced: true });
+    const cs = withAuras([emp, mkCreature(2, "enemy", { x: 3, y: 1 }, {}), mkCreature(3, "enemy", { x: 3, y: 3 }, {})]);
+    expect(cs.find((c) => c.instanceId === 2)!.vulnerability).toBe(0);
+  });
+
+  it("#1217 does not overwrite the permanent vulnerability from a spell (#883 / #1855)", () => {
+    card(1217);
+    const emp = mkCreature(1, "ally", { x: 8, y: 2 }, { cardId: 1217, currentLife: 4, baseLife: 4, range: 3 });
+    const marque = mkCreature(2, "enemy", { x: 3, y: 1 }, { vulnerability: 2 }); // set by a spell
+    const a = withAuras([emp, marque, mkCreature(3, "enemy", { x: 3, y: 3 }, {})]);
+    expect(a.find((c) => c.instanceId === 2)!.vulnerability).toBe(3); // 2 permanent + 1 from the aura
+    // the Empaleur dies: only the aura share goes, the 2 from the spell stay
+    const b = withAuras(a.map((c) => (c.instanceId === 1 ? { ...c, currentLife: 0 } : c)));
+    expect(b.find((c) => c.instanceId === 2)!.vulnerability).toBe(2);
   });
 });
 
@@ -4941,7 +4977,8 @@ describe("Body swap, position + side", () => {
     const marlinePos = { x: 8, y: 2 }; // Marline's summon cell
     s = resolvePendingAction(s, { x: 4, y: 2 }); // pick the enemy → Marline lands then swaps
     const marlineId = s.creatures.find((c) => c.cardId === 272)!.instanceId;
-    // The enemy is now YOURS, standing on Marline's old cell, summoning-sick.
+    // The enemy creature is now yours, on Marline's old cell. Marline also gives it summoning
+    // sickness, so it does not act this turn.
     expect(byId(s, 50)!.owner).toBe("ally");
     expect(byId(s, 50)!.position).toEqual(marlinePos);
     expect(byId(s, 50)!.hasAttacked).toBe(true);
@@ -12041,8 +12078,36 @@ describe("Tas d'Os : transform en Chafer Décrépit (#738 un, #147 tous)", () =>
     let s = scenario([fant]);
     s = { ...s, tasDOs: [{ position: { x: 8, y: 0 }, owner: "ally" }, { position: { x: 8, y: 1 }, owner: "ally" }] };
     s = runTrigger(s, "APPARITION", 920);
-    expect((s.tasDOs ?? []).length).toBe(1);                      // un transformé, un reste
-    expect(s.creatures.some((c) => c.cardId === 313)).toBe(true); // un Chafer Décrépit créé
+    // "Transformez UN tas d'os allié" = the player chooses which one. The engine used to take
+    // the oldest one; it now opens an own_tas_dos pick.
+    expect(s.pendingAction!.filter).toBe("own_tas_dos");
+    const cibles = validPendingTargets(s).map((c) => `${c.x},${c.y}`).sort();
+    expect(cibles).toEqual(["8,0", "8,1"]);
+    s = resolvePendingAction(s, { x: 8, y: 1 });                  // I choose the second one
+    expect((s.tasDOs ?? [])).toEqual([{ position: { x: 8, y: 0 }, owner: "ally" }]); // the other one survives
+    const decrepit = s.creatures.find((c) => c.cardId === 313)!;
+    expect(decrepit.position).toEqual({ x: 8, y: 1 });            // it is born on the chosen cell
+  });
+
+  it("#738: the pick can be declined, clicking elsewhere keeps the tas d'os and loses the effect", () => {
+    card(738); card(313);
+    const fant = mkCreature(925, "ally", { x: 6, y: 2 }, { cardId: 738, triggers: card(738).triggers ?? [] });
+    let s = scenario([fant]);
+    s = { ...s, tasDOs: [{ position: { x: 8, y: 0 }, owner: "ally" }] };
+    s = runTrigger(s, "APPARITION", 925);
+    s = resolvePendingAction(s, { x: 3, y: 4 }); // cell without a tas d'os, so a refusal
+    expect((s.tasDOs ?? []).length).toBe(1);
+    expect(s.creatures.some((c) => c.cardId === 313)).toBe(false);
+    expect(s.pendingAction).toBeNull();
+  });
+
+  it("#738 with no allied tas d'os at all: no pick opens (never an empty pending)", () => {
+    card(738);
+    const fant = mkCreature(926, "ally", { x: 6, y: 2 }, { cardId: 738, triggers: card(738).triggers ?? [] });
+    let s = scenario([fant]);
+    s = { ...s, tasDOs: [{ position: { x: 1, y: 0 }, owner: "enemy" }] }; // an enemy tas d'os
+    s = runTrigger(s, "APPARITION", 926);
+    expect(s.pendingAction).toBeNull();
   });
 
   it("#147 Roi Chafer : APPARITION → transforme TOUS les tas d'os ALLIÉS (pas ceux de l'ennemi)", () => {
@@ -12082,6 +12147,7 @@ describe("Tas d'Os : consomme-pour-bonus (#223 self, #626 autres chafers)", () =
     let s = scenario([elite]);
     s = { ...s, tasDOs: [{ position: { x: 8, y: 0 }, owner: "ally" }] };
     s = runTrigger(s, "APPARITION", 930);
+    s = resolvePendingAction(s, { x: 8, y: 0 }); // "Détruisez UN tas d'os" = the player's choice
     const c = byId(s, 930)!;
     expect(c.currentAttack).toBe(3);         // +1 AT
     expect(c.armor).toBe(1);                 // +1 AR
@@ -12106,6 +12172,7 @@ describe("Tas d'Os : consomme-pour-bonus (#223 self, #626 autres chafers)", () =
     let s = scenario([halle, other]);
     s = { ...s, tasDOs: [{ position: { x: 8, y: 0 }, owner: "ally" }] };
     s = runTrigger(s, "APPARITION", 932);
+    s = resolvePendingAction(s, { x: 8, y: 0 }); // the player's choice
     expect(byId(s, 933)!.currentAttack).toBe(4); // autre chafer +1 AT
     expect(byId(s, 933)!.armor).toBe(1);         // +1 AR
     expect(byId(s, 932)!.currentAttack).toBe(2); // la source (Hallebardier) NON buffée
@@ -14254,15 +14321,30 @@ describe("buff permanent à l'entrée : Grany #289 (chachas +1 AR) & Shin Larve 
     const chacha = s.creatures.find((c) => c.cardId === 135);
     expect(chacha!.armor).toBe(1); // +1 AR appliqué à l'entrée
   });
-  it("#500 Shin Larve : une larve alliée qui ENTRE gagne +1 AT et charge de 1", () => {
+  it("#500 Shin Larve: an allied larva that enters gains +1 AT and charges its whole MP", () => {
+    // The whole MP for Shin Larve. The word "chargent" is bare in the text, so it is a full charge,
+    // the same convention as "APPARITION : Charge" on Tristepin #6 and Protoflex #288. The cards
+    // that put a number on the charge write it ("Charge de 1 case", #56/#244).
     card(500); card(213);
     const shin = mkCreature(1711, "ally", { x: 8, y: 0 }, { cardId: 500, triggers: card(500).triggers ?? [] });
     const sc = scenario([shin]);
     const base = { ...sc, activeSide: "ally" as const, players: { ...sc.players, ally: { ...sc.players.ally, hand: [213], handCostMods: [0], ap: 20 } } };
-    const s = playCard(base, card(213), { x: 8, y: 2 }); // invoque une Larve Bleue (AT de base 2)
+    const s = playCard(base, card(213), { x: 8, y: 2 }); // Larve Bleue: base AT 2, base MP 2
     const larve = s.creatures.find((c) => c.cardId === 213);
     expect(larve!.currentAttack).toBe(3);            // 2 + 1 = 3
-    expect(larve!.position).toEqual({ x: 7, y: 2 }); // a chargé de 1 (8→7)
+    expect(larve!.position).toEqual({ x: 6, y: 2 }); // full charge: 8 → 6 (2 MP), no longer 8 → 7
+  });
+
+  it("#500 Shin Larve: the full charge can engage an enemy within MP range", () => {
+    // A direct consequence of the rule: on a board where the opponent holds x=6, the larva now
+    // reaches contact instead of stopping one cell short.
+    card(500); card(213);
+    const shin = mkCreature(1711, "ally", { x: 8, y: 0 }, { cardId: 500, triggers: card(500).triggers ?? [] });
+    const foe = mkCreature(1712, "enemy", { x: 6, y: 2 }, { currentLife: 9, baseLife: 9, currentAttack: 0, baseAttack: 0 });
+    const sc = scenario([shin, foe]);
+    const base = { ...sc, activeSide: "ally" as const, players: { ...sc.players, ally: { ...sc.players.ally, hand: [213], handCostMods: [0], ap: 20 } } };
+    const s = playCard(base, card(213), { x: 8, y: 2 });
+    expect(byId(s, 1712)!.currentLife).toBeLessThan(9); // engages at the end of its charge
   });
 });
 
@@ -15190,14 +15272,18 @@ describe("Empty-trigger summons (APPARITION/MORT/COUP DE GRÂCE)", () => {
     expect(byId(s, 3)!.currentLife).toBe(9); // two cells ahead → untouched
   });
 
-  it("Pisti Yeul #932 (APPARITION): hits the enemy Dofus when summoned directly in front of it", () => {
+  it("Pisti Yeul #932 (APPARITION): does not hit the Dofus in front of it (its text says nothing about it)", () => {
+    // Pisti Yeul does not hit the Dofus. Its text only says "inflige des dégâts équivalents à son AT
+    // sur la case devant lui", and the convention of the project is that damage never reaches a
+    // Dofus without an explicit mention. The hitDofus flag had been set by hand in the shipped data,
+    // with nothing in the text to back it.
     const pisti = mkCreature(1, "ally", { x: 1, y: 2 }, { cardId: 932, currentAttack: 5, triggers: card(932).triggers ?? [] });
     const base = scenario([pisti]);
-    // Front cell is x=0,y=2, the enemy Dofus column. Give it room to survive the hit.
     const dofuses: DofusInstance[] = base.dofuses.map((d) =>
       d.owner === "enemy" && d.position.x === 0 && d.position.y === 2 ? { ...d, currentLife: 9 } : d);
     const s = runTrigger({ ...base, dofuses }, "APPARITION", 1);
-    expect(s.dofuses.find((d) => d.owner === "enemy" && d.position.y === 2)!.currentLife).toBe(4); // −5
+    expect(s.dofuses.find((d) => d.owner === "enemy" && d.position.y === 2)!.currentLife).toBe(9); // untouched
+    expect(s.log.some((e) => e.type === "DAMAGE" && (e as { targetCell?: unknown }).targetCell)).toBe(false);
   });
 
   it("Goultard #304 (MORT): transforms into Dark Vlad #482 on its own cell", () => {
@@ -15354,18 +15440,53 @@ describe("Remington Smisse (Bombe à la mort / sur prisme, Roublard)", () => {
     expect(cells).toEqual(["6,1", "6,3"]);
   });
 
-  it("#334 (MORT): si une case adjacente (haut) est occupée, bascule sur DEVANT", () => {
+  it("#334 (MORT): if a side is taken, the second Bombe goes behind it, never in front", () => {
+    // The two cells on its sides, on the same row; if one is not available, it summons behind it
+    // (towards the allied Dofus). Row = same x. The cell in front is not part of the pattern: the
+    // old code offered it, which was an invention.
     card(334);
     const remi = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 334, currentLife: 1, baseLife: 1, triggers: card(334).triggers ?? [] });
-    const blocker = mkCreature(2, "ally", { x: 6, y: 1 }, {}); // occupe la case HAUT (6,1)
+    const blocker = mkCreature(2, "ally", { x: 6, y: 1 }, {}); // takes the upper side (6,1)
     const base = { ...scenario([remi, blocker]), prisms: [], traps: [] };
     const creatures = base.creatures.map((c) => (c.instanceId === 1 ? { ...c, currentLife: 0 } : c));
     const s = resolveDeathsAndWin(base, creatures, base.dofuses, [...base.log], new Set());
-    const traps = s.traps ?? [];
-    expect(traps.length).toBe(2);
-    // Haut occupé → priorité [bas (6,3), devant (allié avance x-1 → 5,2)].
-    const cells = traps.map((t) => `${t.position.x},${t.position.y}`).sort();
-    expect(cells).toEqual(["5,2", "6,3"]);
+    const cells = (s.traps ?? []).map((t) => `${t.position.x},${t.position.y}`).sort();
+    // lower side (6,3) + behind (ally, so its Dofus is at x=9, so 6−(−1) = 7,2)
+    expect(cells).toEqual(["6,3", "7,2"]);
+  });
+
+  it("#334 (MORT): both sides free, so no Bombe behind", () => {
+    card(334);
+    const remi = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 334, currentLife: 1, baseLife: 1, triggers: card(334).triggers ?? [] });
+    const base = { ...scenario([remi]), prisms: [], traps: [] };
+    const creatures = base.creatures.map((c) => (c.instanceId === 1 ? { ...c, currentLife: 0 } : c));
+    const s = resolveDeathsAndWin(base, creatures, base.dofuses, [...base.log], new Set());
+    const cells = (s.traps ?? []).map((t) => `${t.position.x},${t.position.y}`).sort();
+    expect(cells).toEqual(["6,1", "6,3"]);
+  });
+
+  it("#334 (MORT): both sides and the fallback taken, so 0 Bombe (no spill)", () => {
+    // "autour de lui" stays strict: there is only one cell behind, so fewer Bombes are placed
+    // rather than looking for a second ring.
+    card(334);
+    const remi = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 334, currentLife: 1, baseLife: 1, triggers: card(334).triggers ?? [] });
+    const b1 = mkCreature(2, "ally", { x: 6, y: 1 }, {});
+    const b2 = mkCreature(3, "ally", { x: 6, y: 3 }, {});
+    const b3 = mkCreature(4, "ally", { x: 7, y: 2 }, {});
+    const base = { ...scenario([remi, b1, b2, b3]), prisms: [], traps: [] };
+    const creatures = base.creatures.map((c) => (c.instanceId === 1 ? { ...c, currentLife: 0 } : c));
+    const s = resolveDeathsAndWin(base, creatures, base.dofuses, [...base.log], new Set());
+    expect((s.traps ?? []).length).toBe(0);
+  });
+
+  it("#334 (MORT): at the edge of the board, the side off the board does not count", () => {
+    card(334);
+    const remi = mkCreature(1, "ally", { x: 6, y: 0 }, { cardId: 334, currentLife: 1, baseLife: 1, triggers: card(334).triggers ?? [] });
+    const base = { ...scenario([remi]), prisms: [], traps: [] };
+    const creatures = base.creatures.map((c) => (c.instanceId === 1 ? { ...c, currentLife: 0 } : c));
+    const s = resolveDeathsAndWin(base, creatures, base.dofuses, [...base.log], new Set());
+    const cells = (s.traps ?? []).map((t) => `${t.position.x},${t.position.y}`).sort();
+    expect(cells).toEqual(["6,1", "7,0"]); // the only legal side + the fallback behind
   });
 
   it("#80 (APPARITION): pick d'un prisme → prisme retiré, Bombe alliée sur sa case", () => {
@@ -16609,17 +16730,44 @@ describe("Maluss #292 : 1 au Dofus adverse de sa ligne quand tu voles/détruis u
 });
 
 describe("La Bulbe Hutte #1199", () => {
-  it("APPARITION invoque 2 Bébé Flaqueux (#1891) à côté ; POST_ADVANCE s'inflige 1", () => {
+  // Text: "MUR. Invoque 2 bébés flaqueux à côté d'elle PUIS s'inflige 1 À LA FIN DE TOUS LES
+  // DÉPLACEMENTS ALLIÉS." The end of the sentence governs both actions (from a report: the Bulbe
+  // Hutte should summon its flaqueux at the end of the turn). Before, the summon was wired on the
+  // APPARITION, so the flaqueux arrived with it.
+  const mk = (life = 3) => mkCreature(1, "ally", { x: 7, y: 2 }, { cardId: 1199, currentLife: life, baseLife: 3, triggers: card(1199).triggers ?? [], properties: new Set(["Statue"]) });
+
+  it("the APPARITION summons nothing", () => {
     card(1199); card(1891);
-    const mk = () => mkCreature(1, "ally", { x: 7, y: 2 }, { cardId: 1199, currentLife: 3, baseLife: 3, triggers: card(1199).triggers ?? [], properties: new Set(["Statue"]) });
-    const s1 = runTrigger(scenario([mk()]), "APPARITION", 1);
-    const babies = s1.creatures.filter((c) => c.cardId === 1891);
-    expect(babies.length).toBe(2); // 2 bébés flaqueux summoned
+    const s = runTrigger(scenario([mk()]), "APPARITION", 1);
+    expect(s.creatures.filter((c) => c.cardId === 1891).length).toBe(0);
+  });
+
+  it("end of the moves: summons 2 Bébé Flaqueux next to it, then deals 1 to itself", () => {
+    card(1199); card(1891);
+    const s = runTrigger(scenario([mk()]), "POST_ADVANCE", 1);
+    const babies = s.creatures.filter((c) => c.cardId === 1891);
+    expect(babies.length).toBe(2);
     // "à côté d'elle" = the two side cells (same x, y±1), never in front/behind or on the diagonal ("il
     // faut que ça soit les deux sur le côté").
     expect(babies.map((c) => `${c.position.x},${c.position.y}`).sort()).toEqual(["7,1", "7,3"]);
-    const s2 = runTrigger(scenario([mk()]), "POST_ADVANCE", 1);
-    expect(byId(s2, 1)!.currentLife).toBe(2); // deals 1 to itself (3 → 2) at the end of the moves
+    expect(byId(s, 1)!.currentLife).toBe(2); // deals 1 to itself (3 → 2)
+  });
+
+  it("« PUIS »: at 1 HP it summons first, and only dies afterwards", () => {
+    card(1199); card(1891);
+    const s = runTrigger(scenario([mk(1)]), "POST_ADVANCE", 1);
+    expect(s.creatures.filter((c) => c.cardId === 1891).length).toBe(2); // both are born
+    expect(byId(s, 1)).toBeUndefined();                                  // then it finished itself off
+  });
+
+  it("in a real game, the flaqueux arrive at the end of their side's turn", () => {
+    card(1199); card(1891);
+    const sc = scenario([mk()]);
+    const s0 = withDecks({ ...sc, activeSide: "ally" as const, prisms: [] });
+    expect(s0.creatures.filter((c) => c.cardId === 1891).length).toBe(0);
+    const s = endTurn(s0);
+    expect(s.creatures.filter((c) => c.cardId === 1891).length).toBe(2);
+    expect(byId(s, 1)!.currentLife).toBe(2);
   });
 });
 
@@ -16716,7 +16864,8 @@ describe("Chafer Traqueur #617 / Coqueline #1827", () => {
     card(617);
     const t1 = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 617, baseMovement: 3, movementLeft: 0, hasAttacked: true, triggers: card(617).triggers ?? [] });
     const s0 = { ...scenario([t1]), tasDOs: [{ position: { x: 4, y: 0 }, owner: "ally" as const }] };
-    const s1 = runTrigger(s0, "APPARITION", 1);
+    // "Détruisez un tas d'os allié": an order given to the player, so a pick.
+    const s1 = resolvePendingAction(runTrigger(s0, "APPARITION", 1), { x: 4, y: 0 });
     expect(byId(s1, 1)!.position.x).toBe(4);        // chargé de 2 (6 → 4)
     expect((s1.tasDOs ?? []).length).toBe(0);       // tas d'os consommé
     const t2 = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 617, baseMovement: 3, movementLeft: 0, hasAttacked: true, triggers: card(617).triggers ?? [] });
@@ -17928,5 +18077,1070 @@ describe("Truche Foldingue #434 : la bascule tombe AU kill, et elle repart dans 
     const s = endTurn(setup({ rng: PILE, roi: true }));
     expect(teamChanges(s)).toBe(0);
     expect(byId(s, 1)!.owner).toBe("ally");
+  });
+});
+
+describe("SILENCE: an ability that lives in card.effects must also be silenced", () => {
+  // The `hadSomething` guard of handleSilence only looked at what leaves a trace on the
+  // instance (properties, triggers, armour, resistance, range, changed stats). A cost aura
+  // or a CHEF aura only lives in card.effects: these creatures were skipped, `silenced` was
+  // never set, and the ~20 `!c.silenced` guards of the engine did nothing for them.
+  const silenceIt = (cardId: number) => {
+    card(cardId); card(220);
+    const c = mkCreature(1, "ally", { x: 6, y: 2 }, {
+      cardId,
+      properties: new Set((card(cardId).properties ?? []) as string[]),
+      triggers: card(cardId).triggers ?? [],
+    });
+    let s = scenario([c], 220);
+    s = { ...s, prisms: [], creatures: withAuras(s.creatures) };
+    return playCard(s, card(220), { x: 6, y: 2 });
+  };
+
+  // The 6 of the 8 earlier silence fixes that did nothing for lack of a marker.
+  for (const [id, nom] of [[819, "Alchimiste Armuree"], [216, "Felida"], [416, "Araknoplasme"],
+                           [355, "Crasslek"], [849, "Silo"], [523, "Excarnus"],
+                           [542, "Piou Royal"], [1100, "Heroine Eternelle"]] as [number, string][]) {
+    it(`#${id} ${nom} is really silenced`, () => {
+      const s = silenceIt(id);
+      expect(byId(s, 1)!.silenced).toBe(true);
+      expect(s.log.some((e) => e.type === "FIGHT_OBJECT_SILENCED")).toBe(true);
+    });
+  }
+
+  it("#542 Piou Royal silenced stops giving its cost reduction to the Piou", () => {
+    // Its ability is 100% in card.effects: ChiefAura +1 AT + CardCostAura -2 AP on the Piou.
+    card(542); card(52); card(220);
+    const piouRoyal = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 542 });
+    let s = scenario([piouRoyal], 220);
+    s = { ...s, prisms: [], creatures: withAuras(s.creatures) };
+    const cible = card(52); // Piou Rouge, Piou family
+    const avant = effectiveCost(s.players.ally, cible, s.creatures);
+    s = playCard(s, card(220), { x: 6, y: 2 });
+    const apres = effectiveCost(s.players.ally, cible, s.creatures);
+    expect(avant).toBe(Math.max(0, (cible.cost ?? 0) - 2)); // the aura applies before
+    expect(apres).toBe(cible.cost);                          // and goes away after the silence
+  });
+
+  it("no regression: a vanilla creature (effects: []) is not marked and does not clutter the log", () => {
+    card(220);
+    const vanille = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 40 });
+    let s = scenario([vanille], 220);
+    s = { ...s, prisms: [] };
+    s = playCard(s, card(220), { x: 6, y: 2 });
+    expect(byId(s, 1)!.silenced).toBeFalsy();
+    expect(s.log.some((e) => e.type === "FIGHT_OBJECT_SILENCED")).toBe(false);
+  });
+});
+
+describe("Breaking through an open wall: a shooter too (Patty / Eksa)", () => {
+  // The Dofus of the lane being already destroyed, a creature that ends its advance on the last
+  // cell breaks through, even at 0 MP. That rule only lived on the melee path; the shooter branch
+  // returns before it, so shooters stayed stuck.
+  const wallOpen = (s: ReturnType<typeof scenario>, y: number, side: "ally" | "enemy") => ({
+    ...s, prisms: [],
+    dofuses: s.dofuses.filter((d) => !(d.owner === side && d.position.y === y)),
+  });
+
+  it("an enemy shooter that runs out of MP in front of the open allied wall breaks through", () => {
+    card(31); // Patty Ceriz, range 3
+    const patty = mkCreature(1, "enemy", { x: 5, y: 3 }, {
+      cardId: 31, currentAttack: 2, baseAttack: 2, range: 3,
+      baseMovement: 3, movementLeft: 3, currentLife: 3, baseLife: 3,
+    });
+    let s = wallOpen(scenario([patty]), 3, "ally");
+    s = endTurn({ ...s, activeSide: "enemy" });
+    expect(byId(s, 1)).toBeUndefined(); // left the board
+    expect(s.log.some((e) => e.type === "FIGHT_OBJECT_REMOVED" && (e as { brokeThrough?: boolean }).brokeThrough)).toBe(true);
+    expect(s.players.enemy.deck).toContain(31); // recycled into its owner's deck
+  });
+
+  it("an allied shooter does the same towards the open enemy wall", () => {
+    card(329); // Eksa Soth
+    const eksa = mkCreature(1, "ally", { x: 4, y: 0 }, {
+      cardId: 329, currentAttack: 3, baseAttack: 3, range: 3,
+      baseMovement: 3, movementLeft: 3, currentLife: 4, baseLife: 4,
+    });
+    let s = wallOpen(scenario([eksa]), 0, "enemy");
+    s = endTurn(s);
+    expect(byId(s, 1)).toBeUndefined();
+    expect(s.players.ally.deck).toContain(329);
+  });
+
+  it("no regression: the Dofus of the lane is alive, so the shooter stays and fires at it", () => {
+    card(329);
+    const eksa = mkCreature(1, "ally", { x: 4, y: 0 }, {
+      cardId: 329, currentAttack: 3, baseAttack: 3, range: 3,
+      baseMovement: 3, movementLeft: 3, currentLife: 4, baseLife: 4,
+    });
+    const s = endTurn({ ...scenario([eksa]), prisms: [] });
+    expect(byId(s, 1)).toBeDefined();
+    expect(s.log.some((e) => e.type === "FIGHT_OBJECT_REMOVED" && (e as { brokeThrough?: boolean }).brokeThrough)).toBe(false);
+  });
+
+  it("no regression: a shooter Wall (Statue) in front of an open wall does not break through", () => {
+    card(329);
+    const statue = mkCreature(1, "ally", { x: 1, y: 0 }, {
+      cardId: 329, currentAttack: 3, baseAttack: 3, range: 3,
+      baseMovement: 0, movementLeft: 0, currentLife: 4, baseLife: 4,
+      properties: new Set(["Statue"]),
+    });
+    let s = wallOpen(scenario([statue]), 0, "enemy");
+    s = endTurn(s);
+    expect(byId(s, 1)).toBeDefined(); // it never advances, so it does not break through
+  });
+});
+
+describe("Tonneau #2004: the heal comes after the charge, as the « puis » says", () => {
+  // "Chargez vos invocations de sa ligne de 1 case PUIS les Pandawas saouls sont soignés de 1."
+  // runTrigger defers the charges after its sorting loop, so an immediate effect written after a
+  // charge ran before it. The heal saw the creatures still untouched, not yet wounded by the
+  // combat of their own charge, and healed nobody.
+  const tonneau = (id: number, y: number) => {
+    card(2004);
+    return mkCreature(id, "ally", { x: 5, y }, {
+      cardId: 2004, currentLife: 2, baseLife: 2, currentAttack: 0, baseAttack: 0,
+      baseMovement: 0, movementLeft: 0, triggers: card(2004).triggers ?? [], properties: new Set(["Statue"]),
+    });
+  };
+  const saoule = (id: number, y: number) => {
+    card(2011); // Barak Oktell, Pandawa family
+    return mkCreature(id, "ally", { x: 7, y }, {
+      cardId: 2011, currentLife: 3, baseLife: 3, currentAttack: 1, baseAttack: 1,
+      baseMovement: 2, movementLeft: 2, properties: new Set(["Saoul"]),
+    });
+  };
+  const bloqueur = (id: number, y: number) =>
+    mkCreature(id, "enemy", { x: 6, y }, { currentLife: 9, baseLife: 9, currentAttack: 2, baseAttack: 2 });
+
+  it("the drunk creature wounded by its own charge is healed afterwards", () => {
+    const s = endTurn({ ...scenario([tonneau(1, 0), saoule(10, 0), bloqueur(20, 0)]), prisms: [] });
+    const heals = s.log.filter((e) => e.type === "LIFE_HEALED" && (e as { instanceId?: number }).instanceId === 10);
+    expect(heals.length).toBeGreaterThan(0);
+  });
+
+  it("the order is right: the heal comes after the damage of the charge combat", () => {
+    const s = endTurn({ ...scenario([tonneau(1, 0), saoule(10, 0), bloqueur(20, 0)]), prisms: [] });
+    const iDmg = s.log.findIndex((e) => e.type === "DAMAGE" && (e as { targetInstanceId?: number }).targetInstanceId === 10);
+    const iHeal = s.log.findIndex((e) => e.type === "LIFE_HEALED" && (e as { instanceId?: number }).instanceId === 10);
+    expect(iDmg).toBeGreaterThanOrEqual(0);
+    expect(iHeal).toBeGreaterThan(iDmg); // the "puis": never the other way round
+  });
+
+  // From a report: "the Tonneaux heal the drunk Pandawas of the other lanes".
+  // "Chargez vos invocations DE SA LIGNE de 1 case puis LES SAOULES sont soignées": "les saoules"
+  // refers to the group already limited to the lane, so the heal never crosses the lane. Locked
+  // here because nothing said it: the `shape: "row"` of the heal only holds through the
+  // `targetCell` passed by runTrigger (the Tonneau's cell), and if that context ever went missing, the heal would go to everyone.
+  it("the heal does not cross the lane: a drunk creature of another lane is not healed", () => {
+    const s = endTurn({ ...scenario([
+      tonneau(1, 0), saoule(10, 0), saoule(11, 2), bloqueur(20, 0), bloqueur(21, 2),
+    ]), prisms: [] });
+    expect(s.log.some((e) => e.type === "LIFE_HEALED" && (e as { instanceId?: number }).instanceId === 10)).toBe(true);  // its lane
+    expect(s.log.some((e) => e.type === "LIFE_HEALED" && (e as { instanceId?: number }).instanceId === 11)).toBe(false); // lane 2: nothing
+  });
+
+  it("two Tonneaux, two lanes: both drunk creatures are healed (before: only one)", () => {
+    const s = endTurn({ ...scenario([
+      tonneau(1, 0), tonneau(2, 1), saoule(10, 0), saoule(11, 1), bloqueur(20, 0), bloqueur(21, 1),
+    ]), prisms: [] });
+    for (const id of [10, 11]) {
+      expect(s.log.some((e) => e.type === "LIFE_HEALED" && (e as { instanceId?: number }).instanceId === id)).toBe(true);
+    }
+  });
+
+  it("no regression: a non-Pandawa, or a sober Pandawa, is not healed", () => {
+    card(2011); card(40);
+    const sobre = mkCreature(10, "ally", { x: 7, y: 0 }, {
+      cardId: 2011, currentLife: 1, baseLife: 3, currentAttack: 0, baseAttack: 0,
+      baseMovement: 0, movementLeft: 0,
+    });
+    const autre = mkCreature(11, "ally", { x: 7, y: 1 }, {
+      cardId: 40, currentLife: 1, baseLife: 3, currentAttack: 0, baseAttack: 0,
+      baseMovement: 0, movementLeft: 0, properties: new Set(["Saoul"]),
+    });
+    const s = endTurn({ ...scenario([tonneau(1, 0), tonneau(2, 1), sobre, autre]), prisms: [] });
+    expect(s.log.some((e) => e.type === "LIFE_HEALED")).toBe(false);
+  });
+});
+
+describe("Héroïne Perfide #1254: its trap aura is cut by silence", () => {
+  // "Tant qu'elle est en jeu, les pièges activés de la main adverse coûtent 4 PA de plus et
+  // infligent 1 dégât supplémentaire." The ability is 100% in card.effects (empty properties and
+  // triggers), so it had both bugs: it was not even marked as silenced, and the two readers of the
+  // aura (`activatedTrapAuraOf`) did not test the flag anyway.
+  const monter = () => {
+    card(1254); card(220); card(40);
+    const perfide = mkCreature(1, "enemy", { x: 3, y: 2 }, { cardId: 1254 });
+    let s = scenario([perfide], 220);
+    return {
+      ...s, prisms: [], creatures: withAuras(s.creatures),
+      players: { ...s.players, ally: { ...s.players.ally, activeTraps: [{ cardId: 40, counter: 2, penalty: 0 }] } },
+    };
+  };
+
+  it("the aura taxes the active trap while it is intact, and goes away once silenced", () => {
+    let s = monter();
+    const piege = card(40);
+    expect(effectiveCost(s.players.ally, piege, s.creatures)).toBe((piege.cost ?? 0) + 4);
+    s = playCard(s, card(220), { x: 3, y: 2 }); // Mot de Silence (global)
+    expect(byId(s, 1)!.silenced).toBe(true);
+    expect(effectiveCost(s.players.ally, piege, s.creatures)).toBe(piege.cost);
+  });
+
+  it("no regression: a dead Héroïne Perfide no longer taxes either", () => {
+    const s = monter();
+    const piege = card(40);
+    const morte = s.creatures.map((c) => ({ ...c, currentLife: 0 }));
+    expect(effectiveCost(s.players.ally, piege, morte)).toBe(piege.cost);
+  });
+});
+
+describe("DamageInFront = ability damage, never spell damage", () => {
+  // The damage of the Héros Chataîgneur is ability damage, not spell damage, like Black Wabbit.
+  // The call with 6 arguments fell back on the default isSpell=true, so this damage was cut or
+  // dodged by the anti-spell modifiers.
+  const chataigneur = (id: number) => {
+    card(920);
+    return mkCreature(id, "ally", { x: 6, y: 2 }, { cardId: 920, triggers: card(920).triggers ?? [] });
+  };
+
+  it("« insensible aux dégâts des sorts » does not dodge a creature ability", () => {
+    card(920);
+    const src = chataigneur(1);
+    const cible = mkCreature(2, "enemy", { x: 4, y: 2 }, {
+      currentLife: 9, baseLife: 9, properties: new Set(["SpellDamageInsensitivity"]),
+    });
+    let s = scenario([src, cible]);
+    s = { ...s, prisms: [], seeds: [{ position: { x: 7, y: 0 }, owner: "ally" }, { position: { x: 7, y: 1 }, owner: "ally" }] };
+    const r = runTrigger(s, "APPARITION", 1);
+    expect(byId(r, 2)!.currentLife).toBe(7);  // 2 allied seeds = 2 damage, taken
+    expect(r.log.some((e) => e.type === "DAMAGE_DODGED")).toBe(false);
+  });
+
+  it("the spell damage reduction (Joris #110) does not cut it either", () => {
+    card(920); card(110);
+    const src = chataigneur(1);
+    const joris = mkCreature(3, "enemy", { x: 2, y: 4 }, { cardId: 110 });
+    const cible = mkCreature(2, "enemy", { x: 4, y: 2 }, { currentLife: 9, baseLife: 9 });
+    let s = scenario([src, joris, cible]);
+    s = { ...s, prisms: [], seeds: [{ position: { x: 7, y: 0 }, owner: "ally" }, { position: { x: 7, y: 1 }, owner: "ally" }],
+          creatures: withAuras([src, joris, cible]) };
+    const r = runTrigger(s, "APPARITION", 1);
+    expect(byId(r, 2)!.currentLife).toBe(7);  // 2 in full, not cut
+  });
+});
+
+describe("Piou #52/#568: « une autre invocation ALLIÉE » does limit the pick to the side", () => {
+  // The text carries the side qualifier, but the shipped effect had no `side`: the filter fell
+  // back on any_creature and the engine also offered the enemies. The mechanism exists and is set
+  // correctly on #986 Flécheur, whose text is the same.
+  for (const id of [52, 568]) {
+    it(`#${id} only targets allies`, () => {
+      card(id);
+      const piou = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: id, triggers: card(id).triggers ?? [] });
+      const allie = mkCreature(2, "ally", { x: 7, y: 1 }, {});
+      const ennemi = mkCreature(3, "enemy", { x: 3, y: 1 }, {});
+      const s = runTrigger(scenario([piou, allie, ennemi]), "APPARITION", 1);
+      expect(s.pendingAction!.filter).toBe("ally_creature");
+      const tgts = validPendingTargets(s);
+      expect(tgts.some((c) => c.x === 7 && c.y === 1)).toBe(true);   // the ally
+      expect(tgts.some((c) => c.x === 3 && c.y === 1)).toBe(false);  // the enemy, no longer offered
+      expect(tgts.some((c) => c.x === 6 && c.y === 2)).toBe(false);  // "une AUTRE": never itself
+    });
+  }
+  it("no regression: #398 Piou Bleu (« à une invocation », with no side) keeps both sides", () => {
+    card(398);
+    const piou = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 398, triggers: card(398).triggers ?? [] });
+    const ennemi = mkCreature(3, "enemy", { x: 3, y: 1 }, {});
+    const s = runTrigger(scenario([piou, ennemi]), "APPARITION", 1);
+    expect(validPendingTargets(s).some((c) => c.x === 3 && c.y === 1)).toBe(true);
+  });
+});
+
+describe("Both Sacrifices hit through the spell path and through the bodyguard", () => {
+  // The guard takes all damage meant for its protected creature, with overflow. And a spell deals
+  // spell damage, so it can be dodged by "insensible aux dégâts des sorts".
+  it("#861 Sacrifice Véritable: the guard takes it instead of its protected creature", () => {
+    card(861);
+    const garde = mkCreature(1, "ally", { x: 5, y: 2 }, { currentLife: 9, baseLife: 9, currentAttack: 0, baseAttack: 0 });
+    const protegee = mkCreature(2, "ally", { x: 7, y: 2 }, { currentLife: 9, baseLife: 9, currentAttack: 3, baseAttack: 3, protectedByGuard: 1 });
+    let s = scenario([garde, protegee], 861);
+    s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(861), { x: 9, y: 2 });
+    expect(byId(s, 2)!.currentLife).toBe(9); // the protected creature takes nothing
+    expect(byId(s, 1)!.currentLife).toBe(6); // the guard takes the 3 AT of the protected creature
+  });
+
+  it("#89 Sacrifice Poupesque: « insensible aux dégâts des sorts » does dodge it", () => {
+    card(89); card(468);
+    const poupee = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 1005, currentLife: 3, baseLife: 3 });
+    const cible = mkCreature(2, "enemy", { x: 3, y: 2 }, {
+      currentLife: 9, baseLife: 9, properties: new Set(["SpellDamageInsensitivity"]),
+    });
+    let s = scenario([poupee, cible], 89);
+    s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, ap: 20, maxAp: 20 } } };
+    const avant = byId(s, 2)!.currentLife;
+    s = playCard(s, card(89), { x: 9, y: 2 });
+    // the target dodges: it is a spell, no longer the combat helper
+    expect(byId(s, 2)!.currentLife).toBe(avant);
+  });
+});
+
+describe("Traps #624/#712: the counter is only armed if the card reaches the hand", () => {
+  // "Place un Piège Mortel Activé dans la main de votre adversaire", and the Activé #681 punishes:
+  // "Vous avez 1 tour pour le jouer ou vos Dofus subiront 1 dégât." With a full hand the card is
+  // burned to tokenDiscard (a pile nobody can reach, since #681/#950 are tokens), so the holder
+  // was punished for not playing a card that could not be played.
+  const poser = (piege: number, jeton: number, nMain: number) => {
+    card(piege); card(jeton);
+    let s = scenario([], piege);
+    const main = Array.from({ length: nMain }, () => 16);
+    s = { ...s, prisms: [], players: { ...s.players,
+      ally: { ...s.players.ally, hand: [piege], handCostMods: [0], ap: 20, maxAp: 20 },
+      enemy: { ...s.players.enemy, hand: main, handCostMods: main.map(() => 0) } } };
+    return playCard(s, card(piege), { x: 0, y: 2 });
+  };
+
+  for (const [piege, jeton, nom] of [[624, 681, "Mortel"], [712, 950, "Troublant"]] as [number, number, string][]) {
+    it(`#${piege} Piège ${nom}: normal hand, card received and counter armed`, () => {
+      const p = poser(piege, jeton, 3).players.enemy;
+      expect(p.hand).toContain(jeton);
+      expect((p.activeTraps ?? []).some((t) => t.cardId === jeton)).toBe(true);
+    });
+    it(`#${piege} Piège ${nom}: full hand, card burned, no counter`, () => {
+      const p = poser(piege, jeton, 10).players.enemy;
+      expect(p.hand).not.toContain(jeton);
+      expect(p.tokenDiscard ?? []).toContain(jeton);   // token, so the pile nobody can reach
+      expect((p.activeTraps ?? []).some((t) => t.cardId === jeton)).toBe(false); // no more punishment
+    });
+  }
+});
+
+describe("#1410 Puissance: « dans votre camp » is about position", () => {
+  // The shipped scope was allies_camp (owner and position). The text does not say "vos
+  // invocations", it says "les invocations PRÉSENTES dans votre camp": an enemy creature that
+  // crossed the middle benefits too. Same reading as #897 Phaeris, #103 Veuve Noire and #112
+  // Déserboss. #1823 Bump, which says "invocations ALLIÉES de son camp", keeps allies_camp.
+  it("an enemy invader in your camp gains the +1 AT", () => {
+    card(1410);
+    const allieChezMoi = mkCreature(1, "ally", { x: 6, y: 2 }, { currentAttack: 2, baseAttack: 2 });
+    const envahisseur = mkCreature(2, "enemy", { x: 6, y: 1 }, { currentAttack: 3, baseAttack: 3 });
+    const ennemiChezLui = mkCreature(3, "enemy", { x: 3, y: 1 }, { currentAttack: 3, baseAttack: 3 });
+    const allieAvance = mkCreature(4, "ally", { x: 3, y: 3 }, { currentAttack: 2, baseAttack: 2 });
+    let s = scenario([allieChezMoi, envahisseur, ennemiChezLui, allieAvance], 1410);
+    s = { ...s, prisms: [] };
+    s = playCard(s, card(1410), { x: 9, y: 2 });
+    expect(byId(s, 1)!.currentAttack).toBe(3); // ally in my camp, so +1
+    expect(byId(s, 2)!.currentAttack).toBe(4); // invader in my camp, so +1 as well
+    expect(byId(s, 3)!.currentAttack).toBe(3); // enemy at home, so nothing
+    expect(byId(s, 4)!.currentAttack).toBe(2); // my ally gone to the enemy's side, so nothing
+  });
+});
+
+describe("No side qualifier = both sides", () => {
+  it("#70 Fan: also charges if the Khan Karkass is an enemy one", () => {
+    // "APPARITION : Charge si Khan Karkass est en jeu." No "vos", no "allié". The engine required a
+    // Khan on your side. #70 is the only one of the 10 allyFamilyInPlay cards with no qualifier.
+    card(70); card(510);
+    const fan = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 70, baseMovement: 3, movementLeft: 0, triggers: card(70).triggers ?? [] });
+    const khanAdverse = mkCreature(2, "enemy", { x: 1, y: 0 }, { cardId: 510 });
+    const s = runTrigger(scenario([fan, khanAdverse]), "APPARITION", 1);
+    expect(byId(s, 1)!.position.x).toBeLessThan(6); // it charged
+  });
+
+  it("#70 Fan: still no charge if there is no Khan Karkass at all", () => {
+    card(70);
+    const fan = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 70, baseMovement: 3, movementLeft: 0, triggers: card(70).triggers ?? [] });
+    const s = runTrigger(scenario([fan]), "APPARITION", 1);
+    expect(byId(s, 1)!.position.x).toBe(6);
+  });
+
+  it("no regression: #321 Sono Sino keeps « un AUTRE Iop » limited to your side", () => {
+    // The allCamps flag is opt-in: the 9 other carriers say "vous avez" / "allié".
+    card(321);
+    expect(JSON.stringify(card(321).triggers ?? [])).not.toContain("allCamps");
+  });
+
+  it("#603 Sipho switches when the opponent plays a Fratrie card", () => {
+    // "Quand un membre de la Fratrie des Oubliés est joué, il se transforme." No side qualifier,
+    // so the plays of both players count. The engine only reacted to yours.
+    card(603); card(751); card(909);
+    const sipho = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 603, triggers: card(603).triggers ?? [] });
+    let s = scenario([sipho]);
+    s = { ...s, prisms: [], activeSide: "enemy",
+      players: { ...s.players, enemy: { ...s.players.enemy, hand: [909], handCostMods: [0], ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(909), { x: 1, y: 0 }); // the opponent plays a Fratrie card (Dathura)
+    // Every Fratrie card first opens its own mill pick: it is resolved so that the play goes
+    // through and the ON_PLAY reactions fire.
+    if (s.pendingAction) s = resolvePendingAction(s, { x: 6, y: 2 });
+    expect(byId(s, 1)!.cardId).toBe(751);
+  });
+
+  it("no regression: an ON_PLAY without side still only reacts to your plays", () => {
+    // The default has not changed: only an explicit side:"any" opens both sides.
+    card(444);
+    expect(JSON.stringify(card(444).triggers ?? [])).not.toContain('"side": "any"');
+  });
+
+  it("#743 Larve blanche on the enemy side: it also cuts your prisms", () => {
+    // "Tant qu'elle est en jeu, les prismes ne déclenchent pas leurs effets." No side named.
+    card(743); card(40);
+    const larveAdverse = mkCreature(1, "enemy", { x: 2, y: 0 }, { cardId: 743, properties: new Set(["DontTriggerPrismsEffects"]) });
+    let s = scenario([larveAdverse], 40);
+    s = { ...s, prisms: [{ position: { x: 8, y: 0 }, owner: "ally", kind: "ap" }],
+      players: { ...s.players, ally: { ...s.players.ally, hand: [40], handCostMods: [0], ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(40), { x: 8, y: 0 });
+    expect(s.players.ally.apReserve).toBe(0);                 // no bonus
+    expect(s.prisms.some((p) => p.position.x === 8 && p.position.y === 0)).toBe(true); // prism intact
+  });
+});
+
+describe("SILENCE = vanilla: no effect survives", () => {
+  const silence = (c: ReturnType<typeof mkCreature>) => {
+    card(220);
+    let s = scenario([c], 220);
+    s = { ...s, prisms: [] };
+    return playCard(s, card(220), { x: 0, y: 0 });
+  };
+
+  it("vulnerability goes away", () => {
+    const v = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 40, vulnerability: 2 });
+    const s = silence(v);
+    expect(byId(s, 1)!.vulnerability).toBe(0);
+    expect(s.log.some((e) => e.type === "PROPERTY_UNAPPLIED" && (e as { property?: string }).property === "Vulnerability")).toBe(true);
+  });
+
+  it("Gangraine (#1439) goes away", () => {
+    const g = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 40, movementPoison: 1 });
+    const s = silence(g);
+    expect(byId(s, 1)!.movementPoison).toBe(0);
+  });
+
+  it("a creature that only carries Gangraine is marked as silenced", () => {
+    // Without the wider `hadSomething` guard, it was skipped and the fix did nothing in exactly
+    // the case that motivates it.
+    const g = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 40, movementPoison: 1 });
+    const s = silence(g);
+    expect(byId(s, 1)!.silenced).toBe(true);
+    expect(s.log.some((e) => e.type === "FIGHT_OBJECT_SILENCED")).toBe(true);
+  });
+
+  it("usurped families (Pupuce #441) go back to the printed families", () => {
+    const p = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 40, familyOverride: ["Wabbit"] });
+    const s = silence(p);
+    expect(byId(s, 1)!.familyOverride).toBeUndefined();
+  });
+
+  it("an immobility given from outside goes away, unlike the printed Wall", () => {
+    // Enraciné #692 / Camouflage #890 / Stabilité #2022 set Rooted on a creature that does not
+    // have it on its card: it is an effect like any other.
+    const c = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 40, properties: new Set(["Rooted"]) });
+    const s = silence(c);
+    expect(byId(s, 1)!.properties.has("Rooted")).toBe(false);
+    expect(s.log.some((e) => e.type === "PROPERTY_UNAPPLIED" && (e as { property?: string }).property === "Rooted")).toBe(true);
+  });
+
+  it("no regression: a vanilla creature is still not marked", () => {
+    const v = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 40 });
+    const s = silence(v);
+    expect(byId(s, 1)!.silenced).toBeFalsy();
+  });
+});
+
+describe("SILENCE: the projected links go away (bodyguard, Dofus invulnerability)", () => {
+  const casteSilence = (s0: ReturnType<typeof scenario>, at: { x: number; y: number }) => {
+    card(220);
+    return playCard({ ...s0, prisms: [] }, card(220), at);
+  };
+
+  it("silenced guard: the protected creature takes the damage itself", () => {
+    const garde = mkCreature(1, "ally", { x: 5, y: 2 }, { cardId: 40, currentLife: 9, baseLife: 9 });
+    const protegee = mkCreature(2, "ally", { x: 7, y: 2 }, { cardId: 40, currentLife: 9, baseLife: 9, protectedByGuard: 1 });
+    const creatures = [garde, protegee].map((c) => (c.instanceId === 1 ? { ...c, silenced: true } : c));
+    applyEffects(creatures, [], [], [{ type: "DamageData", Damage: 3 } as never], { casterSide: "enemy", targetCell: { x: 7, y: 2 } });
+    expect(creatures.find((c) => c.instanceId === 1)!.currentLife).toBe(9); // the guard takes nothing
+    expect(creatures.find((c) => c.instanceId === 2)!.currentLife).toBe(6); // the protected creature takes it
+  });
+
+  it("silenced protected creature: the link goes too (a deliberate exception to « what a creature receives is kept »)", () => {
+    const garde = mkCreature(1, "ally", { x: 5, y: 2 }, { cardId: 40, currentLife: 9, baseLife: 9 });
+    const protegee = mkCreature(2, "ally", { x: 7, y: 2 }, { cardId: 40, currentLife: 9, baseLife: 9, protectedByGuard: 1, silenced: true });
+    const creatures = [garde, protegee];
+    applyEffects(creatures, [], [], [{ type: "DamageData", Damage: 3 } as never], { casterSide: "enemy", targetCell: { x: 7, y: 2 } });
+    expect(creatures.find((c) => c.instanceId === 1)!.currentLife).toBe(9);
+    expect(creatures.find((c) => c.instanceId === 2)!.currentLife).toBe(6);
+  });
+
+  it("no regression: neither is silenced, so the guard still takes it", () => {
+    const garde = mkCreature(1, "ally", { x: 5, y: 2 }, { cardId: 40, currentLife: 9, baseLife: 9 });
+    const protegee = mkCreature(2, "ally", { x: 7, y: 2 }, { cardId: 40, currentLife: 9, baseLife: 9, protectedByGuard: 1 });
+    const creatures = [garde, protegee];
+    applyEffects(creatures, [], [], [{ type: "DamageData", Damage: 3 } as never], { casterSide: "enemy", targetCell: { x: 7, y: 2 } });
+    expect(creatures.find((c) => c.instanceId === 1)!.currentLife).toBe(6);
+    expect(creatures.find((c) => c.instanceId === 2)!.currentLife).toBe(9);
+  });
+
+  it("Artheon #1424 silenced: its Dofus is vulnerable again", () => {
+    card(1424);
+    const artheon = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 1424 });
+    const s0 = scenario([artheon]);
+    const cible = s0.dofuses.find((d) => d.owner === "enemy" && d.position.y === 2)!;
+    const dofuses = s0.dofuses.map((d) => (d === cible ? { ...d, invulnerableBy: 1, currentLife: 9 } : d));
+    const vivant = [{ ...artheon }];
+    const silencie = [{ ...artheon, silenced: true }];
+    expect(dofusInvulnerable(dofuses.find((d) => d.invulnerableBy === 1)!, vivant)).toBe(true);
+    expect(dofusInvulnerable(dofuses.find((d) => d.invulnerableBy === 1)!, silencie)).toBe(false);
+  });
+});
+
+describe("Lien de Sang #1495: the protector also takes the fatigue", () => {
+  // "Elle subira les dégâts à sa place" has no restriction on the source. The fatigue (a draw from
+  // an empty deck, rule 11) hit the Dofus directly, the only damage path that skipped the redirection.
+  const montage = (vieGarde: number) => {
+    const garde = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 40, currentLife: vieGarde, baseLife: vieGarde });
+    let s = scenario([garde]);
+    const cible = s.dofuses.find((d) => d.owner === "ally" && d.position.y === 2)!;
+    return {
+      ...s, prisms: [],
+      dofuses: s.dofuses.map((d) => (d === cible ? { ...d, protectedBy: 1 } : d)),
+      players: { ...s.players, ally: { ...s.players.ally, deck: [], deckCostMods: [] } },
+    };
+  };
+  const dofusLie = (st: ReturnType<typeof scenario>) => st.dofuses.find((d) => d.owner === "ally" && d.position.y === 2)!;
+
+  it("the linked Dofus loses nothing, the protector takes the damage", () => {
+    const s = drawCard(montage(5), "ally"); // draw from an empty deck, so fatigue
+    expect(dofusLie(s).currentLife).toBe(5);   // untouched
+    expect(byId(s, 1)!.currentLife).toBe(4);   // the guard took it
+  });
+
+  it("the other Dofus, not linked, take the damage as usual", () => {
+    const s = drawCard(montage(5), "ally");
+    for (const d of s.dofuses.filter((x) => x.owner === "ally" && x.position.y !== 2)) {
+      expect(d.currentLife).toBe(4);
+    }
+  });
+
+  it("dead guard: the link no longer protects, the Dofus takes the damage again", () => {
+    const base = montage(5);
+    const s = drawCard({ ...base, creatures: base.creatures.map((c) => ({ ...c, currentLife: 0 })) }, "ally");
+    expect(dofusLie(s).currentLife).toBe(4);
+  });
+});
+
+describe("#675 Craqueboule Magmatique: riposte in melee only", () => {
+  // "CONTRE COUP : Inflige 2 dégâts à son adversaire AU CORPS À CORPS." The engine riposted against
+  // any source of damage, ranged shooters included. It takes a real hit, in contact. #756
+  // Belgodass / #399 Polter say "l'invocation qui lui inflige des dégâts", with no qualifier: they
+  // are not concerned.
+  const craq = (id: number, at: { x: number; y: number }) => {
+    card(675);
+    return mkCreature(id, "ally", at, { cardId: 675, currentLife: 9, baseLife: 9, currentAttack: 1, baseAttack: 1, triggers: card(675).triggers ?? [] });
+  };
+
+  it("a ranged shooter does not take the riposte", () => {
+    const cible = craq(1, { x: 6, y: 2 });
+    const tireur = mkCreature(2, "enemy", { x: 3, y: 2 }, {
+      currentLife: 9, baseLife: 9, currentAttack: 2, baseAttack: 2, range: 3,
+      baseMovement: 0, movementLeft: 0,
+    });
+    const s = endTurn({ ...scenario([cible, tireur]), prisms: [], activeSide: "enemy" });
+    expect(byId(s, 1)!.currentLife).toBeLessThan(9); // the Craqueboule did take the shot
+    expect(byId(s, 2)!.currentLife).toBe(9);         // but the shooter takes nothing back
+  });
+
+  it("in melee the riposte still fires", () => {
+    const cible = craq(1, { x: 6, y: 2 });
+    const melee = mkCreature(2, "enemy", { x: 5, y: 2 }, {
+      currentLife: 9, baseLife: 9, currentAttack: 2, baseAttack: 2, baseMovement: 1, movementLeft: 1,
+    });
+    const s = endTurn({ ...scenario([cible, melee]), prisms: [], activeSide: "enemy" });
+    // 9 − 1 (the melee exchange, the Craqueboule has 1 AT) − 2 (the CONTRE COUP riposte) = 6
+    expect(byId(s, 2)!.currentLife).toBe(6);
+  });
+
+  it("effect damage from a neighbour does not trigger the riposte (not a real hit)", () => {
+    const cible = craq(1, { x: 6, y: 2 });
+    const voisin = mkCreature(2, "enemy", { x: 5, y: 2 }, { currentLife: 9, baseLife: 9, currentAttack: 0, baseAttack: 0 });
+    const creatures = [cible, voisin];
+    // spell damage anchored on the Craqueboule's cell, source = the neighbour
+    applyEffects(creatures, [], [], [{ type: "DamageData", Damage: 2 } as never],
+      { casterSide: "enemy", targetCell: { x: 6, y: 2 }, sourceInstanceId: 2 });
+    expect(creatures.find((c) => c.instanceId === 1)!.currentLife).toBe(7);
+    expect(creatures.find((c) => c.instanceId === 2)!.currentLife).toBe(9); // no riposte
+  });
+});
+
+describe("#224 Chacha Or: a continuous passive, not a sweep at placement", () => {
+  // "Remplace vos Chachas Noirs par des Chachas Or." No keyword in the text, so it is not an
+  // APPARITION. While the Chacha Or is in play, any allied Chacha Noir #135 that enters becomes a
+  // Chacha Or at once. The initial sweep at its own arrival is kept.
+  it("initial sweep: the Chachas Noirs already in play are converted when it is placed", () => {
+    card(224); card(135);
+    const noir = mkCreature(1, "ally", { x: 7, y: 1 }, { cardId: 135 });
+    let s = scenario([noir], 224);
+    s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, hand: [224], handCostMods: [0], ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(224), { x: 8, y: 2 });
+    expect(byId(s, 1)!.cardId).toBe(224);
+  });
+
+  it("continuous passive: a Chacha Noir placed afterwards is converted too", () => {
+    card(224); card(135);
+    const or = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 224, triggers: card(224).triggers ?? [] });
+    let s = scenario([or], 135);
+    s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, hand: [135], handCostMods: [0], ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(135), { x: 8, y: 0 });
+    const pose = s.creatures.find((c) => c.instanceId !== 1);
+    expect(pose!.cardId).toBe(224); // converted on entry, no longer a Noir
+  });
+
+  it("with no Chacha Or in play, a Chacha Noir stays Noir", () => {
+    card(135);
+    let s = scenario([], 135);
+    s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, hand: [135], handCostMods: [0], ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(135), { x: 8, y: 0 });
+    expect(s.creatures.some((c) => c.cardId === 135)).toBe(true);
+  });
+
+  it("an enemy Chacha Noir is not converted (« VOS Chachas Noirs »)", () => {
+    card(224); card(135);
+    const or = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 224, triggers: card(224).triggers ?? [] });
+    const noirAdverse = mkCreature(2, "enemy", { x: 2, y: 1 }, { cardId: 135 });
+    let s = scenario([or, noirAdverse], 135);
+    s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, hand: [135], handCostMods: [0], ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(135), { x: 8, y: 0 });
+    expect(byId(s, 2)!.cardId).toBe(135);
+  });
+});
+
+describe("COUP DE GRÂCE on a charge given by a spell", () => {
+  // Milkar #46 "APPARITION : Charge / COUP DE GRÂCE : Charge". Charged by Lait de Bambou #506,
+  // it kills during the charge, so its COUP DE GRÂCE should fire again. The three other charge
+  // paths already collected their kills (applyChargeOnSummon, chargeAllies, the chargeEffects of
+  // runTrigger); only the spell path forgot it.
+  const monter = (cardIdChargeur: number) => {
+    card(cardIdChargeur); card(506);
+    const chargeur = mkCreature(1, "ally", { x: 6, y: 0 }, {
+      cardId: cardIdChargeur, currentAttack: 6, baseAttack: 6, currentLife: 9, baseLife: 9,
+      baseMovement: 2, movementLeft: 0, hasAttacked: true, triggers: card(cardIdChargeur).triggers ?? [],
+    });
+    const victime = mkCreature(2, "enemy", { x: 5, y: 0 }, { currentLife: 1, baseLife: 1, currentAttack: 0, baseAttack: 0 });
+    let s = scenario([chargeur, victime], 506);
+    s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, hand: [506], handCostMods: [0], ap: 20, maxAp: 20 } } };
+    return playCard(s, card(506), { x: 6, y: 0 });
+  };
+
+  it("Milkar #46: the spell's charge kills, then its COUP DE GRÂCE makes it charge again", () => {
+    const s = monter(46);
+    expect(byId(s, 2)).toBeUndefined();          // the victim is dead
+    expect(byId(s, 1)!.position.x).toBe(2);      // 6 -> 4 (charge of the spell) then 4 -> 2 (coup de grâce)
+  });
+
+  it("control: a creature without a coup de grâce stops at the end of the spell's charge", () => {
+    const s = monter(40); // Bouftou Noir, no trigger
+    expect(byId(s, 2)).toBeUndefined();
+    expect(byId(s, 1)!.position.x).toBe(4);      // 6 -> 4, and nothing more
+  });
+});
+
+describe("#24 Sangsuce: the self-heal also turns into damage (the last path not covered)", () => {
+  // "TOUS les soins deviennent des dégâts." Two of the three heal paths were covered, plus the
+  // one of the Dofus; handleHealSelf (HealSelfData) still escaped it. The only card concerned:
+  // Luc Ossit #769 (FIN DE TOUR, Heal 1).
+  it("a wounded Luc Ossit #769 loses 1 HP instead of gaining one when Sangsuce is in play", () => {
+    card(769); card(24);
+    const luc = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 769, currentLife: 2, baseLife: 4, triggers: card(769).triggers ?? [] });
+    const sangsuce = mkCreature(2, "ally", { x: 7, y: 2 }, { cardId: 24, properties: new Set(["HealingsDoDamageInstead"]) });
+    const s = runTrigger(scenario([luc, sangsuce]), "FIN_DE_TOUR", 1);
+    expect(byId(s, 1)!.currentLife).toBe(1);  // 2 − 1, instead of 2 + 1
+  });
+
+  it("no LIFE_HEALED is emitted: a reversed heal does not arm the heal reactors", () => {
+    card(769); card(24);
+    const luc = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 769, currentLife: 2, baseLife: 4, triggers: card(769).triggers ?? [] });
+    const sangsuce = mkCreature(2, "ally", { x: 7, y: 2 }, { cardId: 24, properties: new Set(["HealingsDoDamageInstead"]) });
+    const s = runTrigger(scenario([luc, sangsuce]), "FIN_DE_TOUR", 1);
+    expect(s.log.some((e) => e.type === "LIFE_HEALED")).toBe(false);
+  });
+
+  it("no regression: without Sangsuce, it heals as usual", () => {
+    card(769);
+    const luc = mkCreature(1, "ally", { x: 6, y: 2 }, { cardId: 769, currentLife: 2, baseLife: 4, triggers: card(769).triggers ?? [] });
+    const s = runTrigger(scenario([luc]), "FIN_DE_TOUR", 1);
+    expect(byId(s, 1)!.currentLife).toBe(3);
+    expect(s.log.some((e) => e.type === "LIFE_HEALED")).toBe(true);
+  });
+});
+
+describe("#125 Attirance: the prism never slides into the wall column", () => {
+  it("Dofus of the lane destroyed: the prism stops on the last playable cell", () => {
+    card(125);
+    let s = scenario([], 125);
+    s = { ...s, prisms: [{ position: { x: 4, y: 0 }, owner: "enemy", kind: "ap" }],
+      dofuses: s.dofuses.filter((d) => !(d.owner === "ally" && d.position.y === 0)),
+      players: { ...s.players, ally: { ...s.players.ally, hand: [125], handCostMods: [0], ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(125), { x: 9, y: 2 });
+    const p = s.prisms.find((x) => x.position.y === 0)!;
+    expect(p.position.x).toBe(8); // stops at x=8, never x=9 (wall column, not playable)
+  });
+
+  it("an obstacle stops the pull earlier", () => {
+    card(125);
+    const bloqueur = mkCreature(1, "ally", { x: 6, y: 0 }, {});
+    let s = scenario([bloqueur], 125);
+    s = { ...s, prisms: [{ position: { x: 4, y: 0 }, owner: "enemy", kind: "ap" }],
+      players: { ...s.players, ally: { ...s.players.ally, hand: [125], handCostMods: [0], ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(125), { x: 9, y: 2 });
+    expect(s.prisms.find((x) => x.position.y === 0)!.position.x).toBe(5); // stopped by the creature
+  });
+});
+
+describe("FRATRIE: the family without the keyword, Ush #100 / #426", () => {
+  // A card that can be drawn by a FRATRIE draw effect, but that cannot cast the specific FRATRIE
+  // effect that removes cards from the opponent's deck. The keyword is now gated on the printed
+  // <b>FRATRIE</b> banner, not on the family tag: 32 of the 34 cards of the family print it, the
+  // two Ush do not.
+  for (const id of [100, 426]) {
+    it(`#${id} Ush keeps the Fratrie family (so its synergies)`, () => {
+      expect(card(id).families).toContain("Fratrie");
+    });
+    it(`#${id} Ush does not open the mill pick on the opponent's deck`, () => {
+      card(id);
+      const ennemi = mkCreature(890, "enemy", { x: 2, y: 2 }, { cardId: 40 });
+      let s = scenario([ennemi], id);
+      s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, hand: [id], handCostMods: [0], ap: 20, maxAp: 20 } } };
+      s = playCard(s, card(id), { x: 8, y: 2 });
+      // The pick that opens, if any, is the one of its APPARITION (Dofus), never enemy_creature
+      // for the mill.
+      expect(s.pendingAction?.pendingEffects?.some((e) => e.type === "FratrieMill") ?? false).toBe(false);
+      expect(s.players.enemy.discard).toEqual([]);
+    });
+  }
+
+  it("no regression: a card that prints the banner keeps the keyword (#726 Arpagone)", () => {
+    card(726);
+    expect(card(726).description).toContain("<b>FRATRIE</b>");
+    const ennemi = mkCreature(890, "enemy", { x: 2, y: 2 }, { cardId: 40 });
+    let s = scenario([ennemi], 726);
+    s = { ...s, prisms: [], players: { ...s.players, ally: { ...s.players.ally, hand: [726], handCostMods: [0], ap: 20, maxAp: 20 } } };
+    s = playCard(s, card(726), { x: 8, y: 2 });
+    expect(s.pendingAction?.pendingEffects?.some((e) => e.type === "FratrieMill") ?? false).toBe(true);
+  });
+
+  it("invariant: in the whole pool, no card carries the banner without the family", () => {
+    cards(); // loads the pool
+    for (const c of cards().values()) {
+      if ((c.description ?? "").includes("<b>FRATRIE</b>")) {
+        expect(c.families ?? []).toContain("Fratrie");
+      }
+    }
+  });
+});
+
+describe("MORT resolved at the moment of the lethal hit, in the middle of the advance", () => {
+  // When a creature plays its turn and causes an effect, that effect must be resolved before the
+  // rest of the move. The engine already resolved deaths per mover; the gap was inside an advance:
+  // a killer that moved on to the freed cell hit the next one before the MORT of its first victim
+  // was given out.
+  //
+  // The exact scene of the replay: enemy Black Wabbit 4 AT / 4 HP; allied Scarafon #533 with 1 HP
+  // ("MORT : +1 AR à vos AUTRES invocations"); allied Lela #359 with 4 HP just behind.
+  const scene = () => {
+    card(533); card(359);
+    const wabbit = mkCreature(25, "enemy", { x: 5, y: 2 }, {
+      cardId: 40, currentLife: 4, baseLife: 4, currentAttack: 4, baseAttack: 4,
+      baseMovement: 3, movementLeft: 3, hasAttacked: false,
+    });
+    const scarafon = mkCreature(30, "ally", { x: 6, y: 2 }, {
+      cardId: 533, currentLife: 1, baseLife: 1, currentAttack: 2, baseAttack: 2,
+      triggers: card(533).triggers ?? [],
+    });
+    const lela = mkCreature(26, "ally", { x: 7, y: 2 }, {
+      cardId: 359, currentLife: 4, baseLife: 4, currentAttack: 2, baseAttack: 2,
+    });
+    return endTurn({ ...scenario([wabbit, scarafon, lela]), prisms: [], activeSide: "enemy" });
+  };
+
+  it("Lela gets the +1 AR before being engaged, and survives", () => {
+    const s = scene();
+    expect(byId(s, 30)).toBeUndefined();          // the Scarafon is dead
+    const lela = byId(s, 26);
+    expect(lela).toBeDefined();                    // it survives: that was the bug
+    expect(lela!.currentLife).toBe(1);             // 4 HP, 1 armour, takes 4 -> 3 damage
+  });
+
+  it("the order of the log shows it: the armour gain comes before the damage dealt to Lela", () => {
+    const s = scene();
+    const iAr = s.log.findIndex((e) => e.type === "ARMOR_GAINED" && (e as { instanceId?: number }).instanceId === 26);
+    const iDmg = s.log.findIndex((e) => e.type === "DAMAGE" && (e as { targetInstanceId?: number }).targetInstanceId === 26);
+    expect(iAr).toBeGreaterThanOrEqual(0);
+    expect(iDmg).toBeGreaterThan(iAr);             // the replay shows the buff before the hit
+  });
+
+  it("the MORT fires only once (no second distribution at the final sweep)", () => {
+    const s = scene();
+    // Only gains are counted: Lela's second ARMOR_GAINED is the armour used up by the Wabbit's
+    // hit (a negative change), not a second distribution of the MORT.
+    const gains = s.log.filter((e) => e.type === "ARMOR_GAINED"
+      && (e as { instanceId?: number }).instanceId === 26
+      && ((e as { armorMod?: { modification: number } }).armorMod?.modification ?? 0) > 0);
+    expect(gains).toHaveLength(1);
+  });
+
+  it("no regression: a capture is not a death, its MORT does not fire inline", () => {
+    // A Scarafon that breaks through the enemy wall is captured, not killed: no +1 AR.
+    card(533);
+    const scarafon = mkCreature(30, "ally", { x: 1, y: 2 }, {
+      cardId: 533, currentLife: 1, baseLife: 1, currentAttack: 2, baseAttack: 2,
+      baseMovement: 2, movementLeft: 2, triggers: card(533).triggers ?? [],
+    });
+    const temoin = mkCreature(26, "ally", { x: 7, y: 2 }, { cardId: 40, currentLife: 4, baseLife: 4 });
+    let s = scenario([scarafon, temoin]);
+    s = { ...s, prisms: [], dofuses: s.dofuses.filter((d) => !(d.owner === "enemy" && d.position.y === 2)) };
+    s = endTurn(s);
+    expect(byId(s, 30)).toBeUndefined();           // gone by breaking through
+    expect(byId(s, 26)!.armor).toBe(0);            // no MORT given out
+  });
+});
+
+// The Wabbit meets the Corbacassin and fights; it has 1 HP left at the end of the fight, then the
+// effect of the Corbacassin must be resolved, so the Wabbit takes one damage and dies. It could not
+// advance at the end of its turn, so it dies on the spot without having time to do anything else.
+// And the Corbacassin deals damage around itself, not around the creature that kills it.
+describe("Corbacassin #115: MORT resolved at the moment of the lethal hit", () => {
+  it("the adjacent killer takes the zone before it can move on, and dies on the spot if it loses its life", () => {
+    card(115);
+    // 1 HP, 1 AT: the killer kills it in one hit and takes 1 in melee, then 1 from the MORT.
+    const corbac = mkCreature(60, "enemy", { x: 4, y: 2 }, { cardId: 115, triggers: card(115).triggers ?? [], currentLife: 1, baseLife: 1, currentAttack: 1, baseAttack: 1 });
+    const wabbit = mkCreature(61, "ally", { x: 5, y: 2 }, { currentLife: 2, baseLife: 2, currentAttack: 2, baseAttack: 2, baseMovement: 6, movementLeft: 6, hasAttacked: false });
+    const s = endTurn(withDecks({ ...scenario([corbac, wabbit]), activeSide: "ally" as const, prisms: [] }));
+    expect(byId(s, 60)).toBeUndefined();                                          // the Corbacassin is dead
+    expect(byId(s, 61)).toBeUndefined();                                          // the killer too, on the spot
+    // It had 6 MP: without the zone it would have crossed and hit the enemy Dofus of its lane.
+    expect(s.dofuses.find((d) => d.owner === "enemy" && d.position.y === 2)!.currentLife).toBe(5);
+  });
+
+  it("a killer that survives the zone goes on with its advance", () => {
+    card(115);
+    const corbac = mkCreature(62, "enemy", { x: 4, y: 2 }, { cardId: 115, triggers: card(115).triggers ?? [], currentLife: 1, baseLife: 1, currentAttack: 1, baseAttack: 1 });
+    const wabbit = mkCreature(63, "ally", { x: 5, y: 2 }, { currentLife: 5, baseLife: 5, currentAttack: 2, baseAttack: 2, baseMovement: 1, movementLeft: 1, hasAttacked: false });
+    const s = endTurn(withDecks({ ...scenario([corbac, wabbit]), activeSide: "ally" as const, prisms: [] }));
+    expect(byId(s, 63)!.currentLife).toBe(3); // 5 − 1 (melee) − 1 (MORT zone)
+    expect(byId(s, 63)!.position.x).toBe(4);  // it crossed the freed cell
+  });
+
+  it("the zone is centred on the dead creature, not on its killer", () => {
+    card(115);
+    const corbac = mkCreature(64, "enemy", { x: 4, y: 2 }, { cardId: 115, triggers: card(115).triggers ?? [], currentLife: 1, baseLife: 1, currentAttack: 1, baseAttack: 1 });
+    const wabbit = mkCreature(65, "ally", { x: 5, y: 2 }, { currentLife: 5, baseLife: 5, currentAttack: 2, baseAttack: 2, baseMovement: 1, movementLeft: 1, hasAttacked: false });
+    // Neighbour of the Corbacassin, not of the killer: it takes the zone.
+    const voisin = mkCreature(66, "enemy", { x: 3, y: 1 }, { currentLife: 5, baseLife: 5 });
+    // Neighbour of the killer only (behind it): it takes nothing.
+    const derriere = mkCreature(67, "ally", { x: 6, y: 2 }, { currentLife: 5, baseLife: 5, movementLeft: 0, baseMovement: 0 });
+    const s = endTurn(withDecks({ ...scenario([corbac, wabbit, voisin, derriere]), activeSide: "ally" as const, prisms: [] }));
+    expect(byId(s, 66)!.currentLife).toBe(4); // neighbour of the dead creature: −1
+    expect(byId(s, 67)!.currentLife).toBe(5); // neighbour of the killer only: untouched
+  });
+});
+
+// The victory condition must apply at any moment: as soon as two real enemy Dofus are destroyed,
+// the game is won at once, without waiting for the other creatures to finish their moves.
+describe("Immediate victory at the second real Dofus destroyed", () => {
+  it("the creatures that have not advanced yet no longer play their turn", () => {
+    // The real rows are drawn at random by createInitialState: the test reads the real layout of
+    // this scenario and places the killers in front of two real ones, without ever making any (adding
+    // some would raise the total, and the victory, which counts the real ones lost, would not come).
+    const vide = scenario([]);
+    const [y0, y1] = vide.dofuses.filter((d) => d.owner === "enemy" && d.kind === "real").map((d) => d.position.y);
+    const yTard = [0, 1, 2, 3, 4].find((y) => y !== y0 && y !== y1)!;
+    const a = mkCreature(70, "ally", { x: 1, y: y0 }, { currentAttack: 1, baseAttack: 1, baseMovement: 1, movementLeft: 1, hasAttacked: false });
+    const b = mkCreature(71, "ally", { x: 1, y: y1 }, { currentAttack: 1, baseAttack: 1, baseMovement: 1, movementLeft: 1, hasAttacked: false });
+    const tard = mkCreature(72, "ally", { x: 5, y: yTard }, { baseMovement: 1, movementLeft: 1, hasAttacked: false });
+    const dofuses = vide.dofuses.map((d) =>
+      d.owner === "enemy" && (d.position.y === y0 || d.position.y === y1) ? { ...d, currentLife: 1 } : d,
+    );
+    const s = endTurn(withDecks({ ...vide, creatures: [a, b, tard], activeSide: "ally" as const, prisms: [], dofuses }));
+    expect(s.winner).toBe("ally");
+    expect(byId(s, 72)!.position.x).toBe(5); // the straggler did not advance: the game was already won
+  });
+});
+
+// If Qilby captures a creature during its advance, the card must reach the hand before Qilby goes
+// on with its advance. The visible consequence: if Qilby dies further along in the same advance, the
+// card already captured stays won (before, the coup de grâce was played at the end of the phase
+// and required the killer to be still alive, so the capture was lost).
+describe("Qilby #496: the capture reaches the hand at the moment of the lethal hit", () => {
+  it("keeps the captured card even if it dies further along in the same advance", () => {
+    card(496);
+    const qilby = mkCreature(80, "ally", { x: 6, y: 2 }, {
+      cardId: 496, triggers: card(496).triggers ?? [],
+      currentLife: 5, baseLife: 5, currentAttack: 2, baseAttack: 2, baseMovement: 3, movementLeft: 3, hasAttacked: false,
+    });
+    // Prey with no riposte: Qilby captures it and goes on.
+    const proie = mkCreature(81, "enemy", { x: 5, y: 2 }, { cardId: 16, currentLife: 1, baseLife: 1, currentAttack: 0, baseAttack: 0 });
+    // Wall of meat: it kills Qilby in melee right after.
+    const bourreau = mkCreature(82, "enemy", { x: 4, y: 2 }, { currentLife: 9, baseLife: 9, currentAttack: 5, baseAttack: 5 });
+    const s = endTurn(withDecks({ ...scenario([qilby, proie, bourreau]), activeSide: "ally" as const, prisms: [] }));
+    expect(byId(s, 80)).toBeUndefined();              // Qilby died on the executioner
+    expect(s.players.ally.hand).toContain(16);        // ... but the capture was already won
+    expect(s.players.enemy.discard).not.toContain(16); // the card did leave the opponent's discard
+  });
+});
+
+// When Marline takes possession of an enemy creature, it also gives it summoning sickness. This is
+// different from TakeControl (Séduction #185 / Miranda #107), where the seized creature plays its
+// turn at once.
+describe("Marline #272: the seized creature gets summoning sickness", () => {
+  it("it does not advance at the end of its new owner's turn", () => {
+    const foe = mkCreature(90, "enemy", { x: 4, y: 2 }, { currentAttack: 2, baseAttack: 2, cardId: 69, baseMovement: 3, movementLeft: 3, hasAttacked: false });
+    let s = withDecks(scenario([foe], 272));
+    s = { ...s, prisms: [] };
+    s = playCard(s, card(272), { x: 8, y: 2 });
+    s = resolvePendingAction(s, { x: 4, y: 2 });
+    expect(byId(s, 90)!.owner).toBe("ally");
+    expect(byId(s, 90)!.position).toEqual({ x: 8, y: 2 });
+    s = endTurn(s);
+    expect(byId(s, 90)!.position).toEqual({ x: 8, y: 2 }); // it cannot act: no advance this turn
+  });
+});
+
+// From a report: "Belimberbe did not bring a creature back from the discard in its interaction with
+// Champion Assoiffé". In the replay, Belimberbe is wounded in melee in the middle of its advance,
+// kills its attacker, then goes on to the wall and captures a Dofus. The counter was settled at the
+// end of the advance, when Belimberbe was no longer on the board (a capture removes it, and the path
+// of posthumous ripostes leaves captures out), so the effect was simply lost.
+// The effect must be resolved at the moment it happens, before the advance goes on.
+describe("Prince Belimberbe #1379: CONTRE COUP resolved at the hit taken, even if it captures afterwards", () => {
+  it("brings a creature back from the discard before breaking through the wall", () => {
+    card(1379); card(453);
+    const bel = mkCreature(95, "ally", { x: 2, y: 4 }, {
+      cardId: 1379, triggers: card(1379).triggers ?? [],
+      currentLife: 3, baseLife: 3, currentAttack: 5, baseAttack: 5,
+      baseMovement: 3, movementLeft: 3, hasAttacked: false,
+    });
+    const agresseur = mkCreature(96, "enemy", { x: 1, y: 4 }, { currentLife: 1, baseLife: 1, currentAttack: 1, baseAttack: 1 });
+    const sc = scenario([bel, agresseur]);
+    const dofuses = sc.dofuses.map((d) =>
+      d.owner === "enemy" && d.position.y === 4 ? { ...d, kind: "fake" as const, currentLife: 1 } : d,
+    );
+    const s0 = withDecks({ ...sc, activeSide: "ally" as const, prisms: [], dofuses });
+    const base = { ...s0, players: { ...s0.players, ally: { ...s0.players.ally, hand: [], handCostMods: [], discard: [453] } } };
+    const s = endTurn(base);
+    expect(byId(s, 95)).toBeUndefined();               // it did break through the wall (capture)
+    expect(s.players.ally.hand).toContain(453);        // ... and the CONTRE COUP brought the creature back
+    expect(s.players.ally.discard).not.toContain(453); // it did leave the discard
+  });
+
+  // From a report: "you cannot see what came back to the hand with Belimb".
+  it("logs the return (discard to hand) so that the log can name it", () => {
+    card(1379); card(453);
+    const bel = mkCreature(97, "ally", { x: 6, y: 2 }, { cardId: 1379, triggers: card(1379).triggers ?? [], currentLife: 5, baseLife: 5 });
+    const sc = scenario([bel]);
+    const base = { ...sc, players: { ...sc.players, ally: { ...sc.players.ally, hand: [], handCostMods: [], discard: [453] } } };
+    const s = runTrigger(base, "CONTRE_COUP", 97);
+    expect(s.players.ally.hand).toContain(453);
+    expect(s.log.some((e) => e.type === "CARD_MOVED" && (e as { cardId?: number }).cardId === 453
+      && (e as { from?: string }).from === "discard" && (e as { to?: string }).to === "hand")).toBe(true);
+  });
+});
+
+// From a report: "Marline has 2 ATK and should not have the ATK boost". Marline #166 is printed
+// with 1 AT. Summoned on a side with a CHEF "+1 AT à vos autres invocations", it gets the +1 by
+// right, then its body swap sends it to the opponent, where it is no longer entitled to it. The
+// auras are stored folded into the live stats: without a recompute, it took with it the buff of the
+// side it had just left.
+describe("Marline #166: the body swap reconciles the auras of both sides", () => {
+  const monter = () => {
+    card(166); card(555);
+    const chef = mkCreature(200, "ally", { x: 8, y: 0 }, { cardId: 555, currentAttack: 1, baseAttack: 1, currentLife: 2, baseLife: 2 });
+    const proie = mkCreature(201, "enemy", { x: 4, y: 2 }, { cardId: 9999, currentAttack: 1, baseAttack: 1, printedAttack: 1, currentLife: 4, baseLife: 4 });
+    const sc = scenario([chef, proie], 166);
+    return { ...sc, prisms: [], creatures: withAuras(sc.creatures) };
+  };
+
+  it("the seized creature takes the +1 of the chief it leaves, and the arriving one gets it", () => {
+    let s = monter();
+    expect(byId(s, 201)!.currentAttack).toBe(1); // enemy: no chief on its side
+    s = playCard(s, card(166), { x: 8, y: 2 });
+    s = resolvePendingAction(s, { x: 4, y: 2 });
+    const marline = s.creatures.find((c) => c.cardId === 166)!;
+    expect(marline.owner).toBe("enemy");
+    expect(marline.currentAttack).toBe(1); // printed 1 AT: the +1 of the allied chief is given back
+    expect(marline.auraAttack).toBe(0);
+    const saisie = byId(s, 201)!;
+    expect(saisie.owner).toBe("ally");
+    expect(saisie.currentAttack).toBe(2); // 1 printed + 1 from the chief it now depends on
+  });
+
+  it("the recompute does not erase the summoning sickness of the seized creature", () => {
+    let s = monter();
+    s = playCard(s, card(166), { x: 8, y: 2 });
+    s = resolvePendingAction(s, { x: 4, y: 2 });
+    expect(byId(s, 201)!.movementLeft).toBe(0);
+    expect(byId(s, 201)!.hasAttacked).toBe(true);
+  });
+});
+
+// From a report: "Jet did not charge although the championne took damage".
+// Jet le Pied Volant #158: "Charge de 1 case lorsqu'une AUTRE de vos invocations ou un de vos Dofus
+// subit des dégâts." The damage dealt by the APPARITION of a creature played from the hand fired no
+// reaction, neither ON_DAMAGE nor CONTRE COUP, while the same damage dealt by a spell did. It was
+// the only damage path of the engine that settled nothing.
+describe("Jet le Pied Volant #158: the damage of an APPARITION does trigger the reactions", () => {
+  const jet = (id: number, x: number, y: number) => {
+    card(158);
+    return mkCreature(id, "ally", { x, y }, {
+      cardId: 158, triggers: card(158).triggers ?? [],
+      currentLife: 6, baseLife: 6, currentAttack: 4, baseAttack: 4,
+      baseMovement: 2, movementLeft: 0, hasAttacked: true,
+    });
+  };
+
+  it("APPARITION played from the hand: Jet charges when an ally is wounded", () => {
+    card(124); // Cactoblong: APPARITION, deals 2 to itself
+    const j = jet(300, 5, 0);
+    const s0 = withDecks({ ...scenario([j], 124), prisms: [] });
+    const s = playCard(s0, card(124), { x: 8, y: 2 });
+    expect(byId(s, 300)!.position.x).toBe(4); // it charged one cell
+  });
+
+  it("APPARITION held behind a pick (NÉCROME): same thing, the dead one included", () => {
+    // A rebuild of the report: the opponent plays Apôtre Nécrose #688 (NÉCROME, "inflige 2 aux
+    // invocations ADVERSES dans votre camp"). The zone hits two creatures of Jet's side, one of which
+    // dies, and it is precisely the dead one that must arm Jet, while after the purge its side can no
+    // longer be read on the board.
+    card(688);
+    const j = { ...jet(301, 5, 1), owner: "enemy" as const };
+    const victime = mkCreature(302, "enemy", { x: 7, y: 2 }, { currentLife: 2, baseLife: 2 });
+    let s = withDecks({ ...scenario([j, victime], 688), prisms: [] });
+    s = playCard(s, card(688), { x: 8, y: 1 });
+    // The NÉCROME opens its reveal pick: it is declined by clicking on the board.
+    if (s.pendingAction) s = resolvePendingAction(s, { x: 3, y: 3 });
+    expect(byId(s, 302)).toBeUndefined();       // Jet's ally died from the zone
+    expect(byId(s, 301)!.position.x).toBe(6);   // Jet (enemy side) charged one cell, towards growing x
+  });
+});
+
+// The Dofus counterpart of the pre-purge roster: "ou un de vos Dofus subit des dégâts" must also
+// hold when the hit destroys it. The dead Dofus leaving the board, its side could not be read and
+// Jet #158, the only carrier of includeDofus, did not fire.
+describe("Jet le Pied Volant #158: a destroyed Dofus still arms the charge", () => {
+  it("charges when one of its Dofus is destroyed by the hit", () => {
+    card(158);
+    const jet = mkCreature(310, "ally", { x: 5, y: 2 }, {
+      cardId: 158, triggers: card(158).triggers ?? [],
+      currentLife: 6, baseLife: 6, baseMovement: 2, movementLeft: 0, hasAttacked: true,
+    });
+    const briseur = mkCreature(311, "enemy", { x: 8, y: 0 }, {
+      currentAttack: 5, baseAttack: 5, currentLife: 5, baseLife: 5, baseMovement: 1, movementLeft: 1, hasAttacked: false,
+    });
+    const sc = scenario([jet, briseur]);
+    const dofuses = sc.dofuses.map((d) =>
+      d.owner === "ally" && d.position.y === 0 ? { ...d, kind: "fake" as const, currentLife: 1 } : d,
+    );
+    const s = endTurn(withDecks({ ...sc, activeSide: "enemy" as const, prisms: [], dofuses }));
+    expect(s.dofuses.some((d) => d.owner === "ally" && d.position.y === 0 && d.currentLife > 0)).toBe(false); // destroyed
+    expect(byId(s, 310)!.position.x).toBe(4); // Jet charged one cell even though the Dofus is gone
   });
 });

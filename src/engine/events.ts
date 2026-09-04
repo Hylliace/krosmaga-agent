@@ -160,7 +160,19 @@ export type GameEvent =
   | { type: "CARD_COUNTER_CREATED"; instanceId: number; initialValue: number; maxValue: number }
   | { type: "CARD_COUNTER_CHANGED"; instanceId: number; counterMod: ValueModification }
   // ===== Misc rituals / sub-systems =====
-  | { type: "DICE_THROW"; instanceId?: number; result: number; sides: number }
+  // A real die roll (Ecaflip d6) at the exact moment of the roll. `at` = cell where the die
+  // lands (target of the spell / cell of the carrier); with no cell, `instanceId` (the creature
+  // concerned) then `side` (die at the portrait of the god, e.g. Dé du Chacha #514, which adds to
+  // the hand) are the fallback seats. `spell` = a roll from a spell, so the original cast sequence
+  // adds the MiddleImpact shockwave when the die lands; a property or creature roll (global script
+  // "Dice Rolled") shows the die alone, 1.5 s.
+  | { type: "DICE_THROW"; instanceId?: number; at?: Coords; side?: Side; spell?: boolean; result: number; sides: number }
+  // A coin flip ("A OU B") at the moment of the flip. `face` = the resolved branch (pile = the
+  // first, positive one, forced by Trucage). Seated like the die: `at` (cell of the carrier or of
+  // the dead creature), otherwise `instanceId`, otherwise `side` (spells, all castTarget AlliedGod,
+  // so the coin goes to the portrait of the god). The original global script "Dice Thrown": the
+  // coin alone, 2.0 s, no cell wave.
+  | { type: "COIN_FLIP"; instanceId?: number; at?: Coords; side?: Side; face: "pile" | "face" }
   | { type: "XELOR_CLOCK_UPDATED"; tick: number }
   | { type: "PHORZERKER_TRANSFORMATION"; instanceId: number; cardIdBefore: number; cardIdAfter: number }
   | { type: "EVOLUTIVE_CARD_XP_GAINED"; cardId: number; xpGained: number }

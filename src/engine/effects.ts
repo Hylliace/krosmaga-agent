@@ -16,7 +16,7 @@
 import type { Effect, DynamicValue } from "../data/types";
 import type { Coords, Side } from "./board";
 import { BOARD_COLS, sameCoords, isAlliedTerritory, isImmovable } from "./board";
-import { getCard, summonsOfCost, famsOf } from "./cardRegistry";
+import { getCard, summonsOfCost, famsOf, effsOf } from "./cardRegistry";
 import type { Rng } from "./rng";
 import type { CreatureInstance, DofusInstance, GameEvent } from "./state";
 
@@ -59,6 +59,11 @@ export interface EffectContext {
   // records the victim's {cardId, owner}; the caller (runTrigger) moves it from
   // the owner's discard to the CASTER's hand after death resolution.
   bounceKilledSink?: { cardId: number; owner: "ally" | "enemy" }[];
+  // Sink for the reversions of temporary maluses set by a trigger. The `duration`
+  // block of playCardInner only reads card.effects, so an effect with a duration
+  // carried by a trigger (APPARITION...) would otherwise apply for good. The effect
+  // layer puts the measured reversion here, and rules moves it to pendingReversions.
+  tempReversionSink?: { kind: "stat"; expireSide: "ally" | "enemy"; field: "attack" | "armor" | "movement" | "range" | "life"; amount: number; instanceIds: number[] }[];
   // Per-cell hook for forced slides (push / attract / retreat via slideCreatureBack).
   // When set, each cell a sliding creature crosses goes through this callback so it
   // interacts with the board exactly like a normal advance step: gangrène
@@ -109,19 +114,50 @@ function rollDice(n: number, sides: number, rng?: Rng, floor = 0): number {
   return total;
 }
 
-export function resolveDynamicValue(v: DynamicValue, rng?: Rng, floor = 0): number {
+// `onRoll` fires only when a real die was rolled (never for constants), with the
+// post-floor total (Dé Pipé: the face the player must see is the floored value).
+// This is the single choke point every d6 in the game goes through, so the DICE_THROW
+// beat (the Ecaflip die animation) can be emitted exactly at its instant.
+export function resolveDynamicValue(v: DynamicValue, rng?: Rng, floor = 0, onRoll?: (result: number, sides: number) => void): number {
   if (typeof v === "number") return v;
   if ("const" in v && typeof v.const === "number") return v.const;
   const o = v as { type?: string; dice?: string };
   // Dice values (Ecaflip's Dé cards): the bindata "TriggeringDiceValue" is a
   // 1d6, and our description parser emits { dice: "NdM" }. Rolled at resolve
   // time, from the seeded RNG when available; `floor` applies Dé Pipé.
-  if (o.type === "TriggeringDiceValue") return rollDice(1, 6, rng, floor);
+  if (o.type === "TriggeringDiceValue") {
+    const r = rollDice(1, 6, rng, floor);
+    onRoll?.(r, 6);
+    return r;
+  }
   if (typeof o.dice === "string") {
     const m = /^(\d*)d(\d+)$/.exec(o.dice);
-    if (m) return rollDice(parseInt(m[1] || "1", 10), parseInt(m[2], 10), rng, floor);
+    if (m) {
+      const sides = parseInt(m[2], 10);
+      const r = rollDice(parseInt(m[1] || "1", 10), sides, rng, floor);
+      onRoll?.(r, sides);
+      return r;
+    }
   }
   return 0;
+}
+
+// Builds the `onRoll` sink for one effect application: pushes the DICE_THROW
+// beat (Ecaflip die tumble) into the event log at the very instant the die is
+// rolled. `at`/`instanceId` seat the die on the concerned cell; `spell` tells
+// the FX layer to add the cell shockwave (spell-cast sequences only; the
+// property/creature global script "Dice Rolled" shows the bare die).
+function diceSink(log: GameEvent[], ctx: EffectContext): (result: number, sides: number) => void {
+  return (result, sides) => {
+    log.push({
+      type: "DICE_THROW",
+      instanceId: ctx.selfInstanceId ?? ctx.targetInstanceId,
+      at: ctx.targetCell ? { ...ctx.targetCell } : undefined,
+      spell: ctx.isSpell === true,
+      result,
+      sides,
+    });
+  };
 }
 
 // Read the optional AoE scope the merge may have stamped on a stat effect
@@ -132,10 +168,30 @@ function scopeOf(effect: Effect): Scope | undefined {
     ? (s as Scope)
     : undefined;
 }
+// Name of the drunk property of the Pandawa god. A free string (properties are a
+// Set<string>, not a closed enum); the UI already reads it in boardViews.ts to pick
+// the "drunk" animation set of rig 44.
+export const SAOUL = "Saoul";
+
+/** Pandawa god: drunkenness does not survive a change of control.
+ *  Call it at every change of owner: capture, gift, defection on a coup de grâce,
+ *  and reversion (going back to the original side is also a change of control).
+ *  The log is optional: some reversion sites do not have one at hand, and the UI
+ *  derives the drunk state from the Set of properties, not from the event. */
+export function shedDrunkOnControlChange(c: CreatureInstance, log?: GameEvent[]): void {
+  if (!c.properties.has(SAOUL)) return;
+  c.properties = new Set(c.properties);
+  c.properties.delete(SAOUL);
+  log?.push({ type: "PROPERTY_UNAPPLIED", instanceId: c.instanceId, property: SAOUL });
+}
 const familyOf = (effect: Effect): string | undefined => (effect as { family?: string }).family;
 const godOf = (effect: Effect): string | undefined => (effect as { god?: string }).god; // classe/dieu (Synchroniseur #714 "vos autres Xélors")
 const excludeSelfOf = (effect: Effect): boolean | undefined => (effect as { excludeSelf?: boolean }).excludeSelf;
 const woundedOf = (effect: Effect): boolean | undefined => (effect as { wounded?: boolean }).wounded;
+// Pandawa god: drunkenness sub-filters and MP threshold, read like `wounded`.
+const drunkOf = (effect: Effect): boolean | undefined => (effect as { drunk?: boolean }).drunk;
+const soberOf = (effect: Effect): boolean | undefined => (effect as { sober?: boolean }).sober;
+const minMoveOf = (effect: Effect): number | undefined => (effect as { minMovement?: number }).minMovement;
 
 // A Dofus is invulnerable when either:
 //   - Artheon #1424: the creature that targeted it (invulnerableBy) is still alive, a single Dofus
@@ -146,8 +202,11 @@ const woundedOf = (effect: Effect): boolean | undefined => (effect as { wounded?
 // off automatically when the protecting creature dies (currentLife > 0 gate).
 export function dofusInvulnerable(d: { invulnerableBy?: number; invulnerableTurns?: number; owner?: CreatureInstance["owner"] }, creatures: CreatureInstance[]): boolean {
   if ((d.invulnerableTurns ?? 0) > 0) return true; // Orbe Doré #594: temporary invulnerability (turn-counted)
-  if (d.invulnerableBy != null && creatures.some((c) => c.instanceId === d.invulnerableBy && c.currentLife > 0)) return true;
-  return d.owner != null && creatures.some((c) => c.owner === d.owner && c.currentLife > 0 && c.properties.has("ProtectsOwnDofus"));
+  // A silenced Artheon #1424 makes its Dofus vulnerable again (the effect of the creature is
+  // silenced, so the Dofus is vulnerable again). Same for a carrier of ProtectsOwnDofus
+  // (Grougaloragran #397): silenced, it no longer gives its aura.
+  if (d.invulnerableBy != null && creatures.some((c) => c.instanceId === d.invulnerableBy && c.currentLife > 0 && !c.silenced)) return true;
+  return d.owner != null && creatures.some((c) => c.owner === d.owner && c.currentLife > 0 && !c.silenced && c.properties.has("ProtectsOwnDofus"));
 }
 
 // The single entry point for Dofus damage. Every site that lowers a Dofus's life has to go
@@ -204,6 +263,16 @@ export function woundDofus(
   isMirror = false,
 ): void {
   if (amount <= 0) return;
+  // Gueule de Bois #2039: the reduction is taken off here, at the single point
+  // every Dofus damage goes through, so it holds for every source (a creature's
+  // attack, a spell, an effect, a reflection), not only spells. It applies per
+  // hit, before the shield: a hit brought down to 0 does not use up the
+  // Pissenlit #1041.
+  const reduction = Math.max(0, (dofus.damageReduction ?? 0) | 0);
+  if (reduction > 0) {
+    amount = Math.max(0, amount - reduction);
+    if (amount <= 0) return;
+  }
   // Pissenlit Maléfique #1041: a one-hit shield absorbs the entire hit, then is consumed. (No log
   // event, there is no Dofus-shield-break GameEvent yet; the Dofus simply takes no damage.)
   if (dofus.shielded) {
@@ -224,7 +293,7 @@ export function woundDofus(
   if (!isMirror) {
     const ownerHasMirror = creatures.some(
       (c) => c.currentLife > 0 && c.owner === dofus.owner &&
-        (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "MirrorAllyDofusDamageToEnemyRow"),
+        (effsOf(c)).some((e) => e.type === "MirrorAllyDofusDamageToEnemyRow"),
     );
     if (ownerHasMirror) {
       const enemyDof = dofuses.find(
@@ -243,7 +312,7 @@ export function woundDofus(
   // amount; only hits creatures (never a Dofus) so it cannot chain woundDofus, fires on every hit.
   for (const julith of creatures) {
     if (julith.currentLife <= 0 || julith.owner !== dofus.owner) continue;
-    const marker = (getCard(julith.cardId)?.effects ?? []).find((e) => e.type === "DamageEnemiesOnAllyDofusDamage") as { amount?: number } | undefined;
+    const marker = (effsOf(julith)).find((e) => e.type === "DamageEnemiesOnAllyDofusDamage") as { amount?: number } | undefined;
     if (!marker) continue;
     const dmg = marker.amount ?? 1;
     for (const c of creatures) {
@@ -261,7 +330,7 @@ export function woundDofus(
   if (dofus.currentLife <= 0) {
     for (const martyr of creatures) {
       if (martyr.currentLife <= 0 || martyr.owner !== dofus.owner) continue;
-      const marker = (getCard(martyr.cardId)?.effects ?? []).find((e) => e.type === "DamageEnemiesOnAllyDofusDestroyed") as { amount?: number } | undefined;
+      const marker = (effsOf(martyr)).find((e) => e.type === "DamageEnemiesOnAllyDofusDestroyed") as { amount?: number } | undefined;
       if (!marker) continue;
       const dmg = marker.amount ?? 0;
       if (dmg <= 0) continue;
@@ -328,14 +397,104 @@ export function applyEffect(
       }
       return;
     }
+    case "BoostResistance": {
+      // Lien Spiritueux (Pandawa god): "Augmente la résistance de vos Pandawas
+      // de 1". It only acts on the ones that already have resistance (in practice
+      // the drunk ones) and never gives any to a sober one. Hence
+      // `requireResistance`, without which it would be a universal buff.
+      const e = effect as { amount: number; requireResistance?: boolean };
+      const exige = e.requireResistance === true;
+      for (const c of creatures) {
+        if (c.currentLife <= 0) continue;
+        if (!scopeMatches(c, scopeOf(effect) ?? "allies", ctx.casterSide)) continue;
+        if (familyOf(effect) && !famsOf(c).includes(familyOf(effect)!)) continue;
+        if (exige && c.resistance <= 0) continue;
+        if (drunkOf(effect) && !c.properties.has(SAOUL)) continue;
+        const avant = c.resistance;
+        c.resistance = Math.max(0, avant + (e.amount | 0));
+        if (c.resistance !== avant) log.push({ type: "PROPERTY_APPLIED", instanceId: c.instanceId, property: "Resistance" });
+      }
+      return;
+    }
+    case "TeleportInFrontOfFamily": {
+      // Chamrak (Pandawa god): "Une invocation se téléporte DEVANT le premier
+      // <famille> allié de SA LIGNE". Lane = same y. The sweep goes from the
+      // creature towards the front of its side and stops at the first member of
+      // the family; the landing cell is the one just in front of it, if free.
+      // If there is no free cell in front of the Tonneau, it teleports behind
+      // the Tonneau instead; with no Tonneau on the lane, the effect does nothing.
+      // "Devant" = the caster's enemy side (the Tonneau is allied to the caster
+      // and faces the enemy, whatever the side of the moved creature). "Le
+      // premier Tonneau" = the closest to the creature, the ones in front of it first.
+      const e = effect as { family: string };
+      if (!ctx.targetCell) return;
+      const me = creatures.find((c) => sameCoords(c.position, ctx.targetCell!) && c.currentLife > 0);
+      if (!me || me.properties.has("Rooted") || me.properties.has("Statue")) return;
+      const avant = ctx.casterSide === "ally" ? -1 : 1;   // the caster's front
+      const devantMoi = me.owner === "ally" ? -1 : 1;     // the target's front
+      const ancres = creatures
+        .filter((c) => c.currentLife > 0 && c.owner === ctx.casterSide &&
+                       c.position.y === me.position.y && famsOf(c).includes(e.family) &&
+                       c.instanceId !== me.instanceId)
+        .sort((a, b) => {
+          const fa = (a.position.x - me.position.x) * devantMoi > 0 ? 0 : 1;   // in front of the creature first
+          const fb = (b.position.x - me.position.x) * devantMoi > 0 ? 0 : 1;
+          return fa - fb || Math.abs(a.position.x - me.position.x) - Math.abs(b.position.x - me.position.x);
+        });
+      const ancre = ancres[0];
+      if (!ancre) return;                                  // no Tonneau: no effect
+      const libre = (cible: { x: number; y: number }) =>
+        cible.x >= 1 && cible.x <= 8 &&
+        !creatures.some((c) => c.currentLife > 0 && sameCoords(c.position, cible)) &&
+        !dofuses.some((d) => d.currentLife > 0 && sameCoords(d.position, cible));
+      for (const cible of [{ x: ancre.position.x + avant, y: ancre.position.y },     // in front
+                           { x: ancre.position.x - avant, y: ancre.position.y }]) {  // otherwise behind
+        if (!libre(cible)) continue;
+        const depuis = { ...me.position };
+        me.position = { ...cible };
+        log.push({ type: "FIGHT_OBJECT_MOVED", instanceId: me.instanceId, from: depuis, to: { ...cible }, movementType: "TELEPORT" });
+        return;
+      }
+      return;
+    }
+    case "ToggleDrunk": {
+      // Alfonse Dé: "rend un Pandawa allié saoul OU sobre". An automatic toggle of
+      // the current state, not a choice. An engine without UnsetProperty could not
+      // sober a creature up, so it is done here, on the clicked target, and only if
+      // it is a Pandawa.
+      if (!ctx.targetCell) return;
+      const c = creatures.find((x) => sameCoords(x.position, ctx.targetCell!) && x.currentLife > 0);
+      if (!c || !famsOf(c).includes("Pandawa")) return;
+      if (c.owner !== ctx.casterSide) return; // "un Pandawa ALLIÉ", never an enemy one
+      const props = new Set(c.properties);
+      if (props.has(SAOUL)) {
+        props.delete(SAOUL);
+        log.push({ type: "PROPERTY_UNAPPLIED", instanceId: c.instanceId, property: SAOUL });
+      } else {
+        props.add(SAOUL);
+        log.push({ type: "PROPERTY_APPLIED", instanceId: c.instanceId, property: SAOUL });
+      }
+      c.properties = props;
+      return;
+    }
     case "DamageDofusPerArmoredAlly": {
       // Attaque Naturelle #1012: each of the caster's creatures with armour (armor>0) deals N to
       // the enemy Dofus on its row. Several armoured allies on the same row stack onto that Dofus
       // (a Dofus brought to 0 by an earlier hit is skipped). Captures settled by resolveDeathsAndWin.
-      const amount = (effect as { amount: number }).amount | 0;
+      // Pandatak (Pandawa god): "Vos Pandawas SAOULS infligent 1 dégât au Dofus
+      // adverse de leur ligne", the same mechanic with another selection criterion.
+      // So it is generalised rather than cloned: `family` + `drunk` narrow it, and
+      // `requireArmor:false` drops the armour requirement of Attaque Naturelle #1012.
+      const e = effect as { amount: number; family?: string; drunk?: boolean; sober?: boolean; requireArmor?: boolean };
+      const amount = e.amount | 0;
+      const exigeAr = e.requireArmor !== false;
       if (amount <= 0) return;
       for (const c of creatures) {
-        if (c.currentLife <= 0 || c.owner !== ctx.casterSide || c.armor <= 0) continue;
+        if (c.currentLife <= 0 || c.owner !== ctx.casterSide) continue;
+        if (exigeAr && c.armor <= 0) continue;
+        if (e.family && !famsOf(c).includes(e.family)) continue;
+        if (e.drunk && !c.properties.has(SAOUL)) continue;
+        if (e.sober && c.properties.has(SAOUL)) continue;
         const dof = dofuses.find((d) => d.currentLife > 0 && d.owner !== ctx.casterSide && d.position.y === c.position.y);
         if (!dof || dofusInvulnerable(dof, creatures)) continue; // Artheon #1424
         woundDofus(dof, amount, log, creatures, dofuses); // canonical Dofus damage (breaks any Sinistro)
@@ -346,12 +505,14 @@ export function applyEffect(
     }
     case "DamageAllByOwnAttack": {
       // Sacrifice Véritable #861: every living creature (both sides) takes damage = its own current AT.
+      // Bodyguard (#320 Silas / #300 Bould Erdash): the guard takes all damage meant for its
+      // protected creature, self-damage included, with overflow past its own life. The direct
+      // call to applyDamageToCreatureFromSpell bypassed the redirection, which only lives in the
+      // wrapper, so the protected creature took the hit itself.
+      // dealSpellDamageThroughGuard already logs the DAMAGE and the removal.
       for (const c of [...creatures]) {
         if (c.currentLife <= 0 || c.currentAttack <= 0) continue;
-        const armorBefore = c.armor;
-        const dealt = applyDamageToCreatureFromSpell(c, c.currentAttack, log, creatures, ctx.casterSide);
-        if (dealt > 0 || armorBefore > c.armor) log.push({ type: "DAMAGE", sourceInstanceId: ctx.sourceInstanceId ?? -1, targetInstanceId: c.instanceId, damage: dealt, armorHit: armorBefore > c.armor });
-        if (c.currentLife <= 0) log.push({ type: "FIGHT_OBJECT_REMOVED", instanceId: c.instanceId });
+        dealSpellDamageThroughGuard(c, c.currentAttack, log, creatures, ctx.sourceInstanceId ?? -1, ctx.casterSide);
       }
       return;
     }
@@ -377,7 +538,15 @@ export function applyEffect(
       // invulnerable Dofus drops out of the pool, so we re-filter every point.
       // RNG from ctx (seeded → reproducible in sims/replays); resolveDeathsAndWin
       // settles each capture / spawn-range afterwards.
-      let n = (effect as { amount: number }).amount | 0;
+      // The amount accepts a die (V2 Craps #10 "1d6 dégâts répartis"), so it goes
+      // through resolveDynamicValue, and the roll is captured in ctx.diceRoll as
+      // handleDamage does: it is the only write that feeds the "sur N ou moins"
+      // markers. A plain number goes through unchanged.
+      const rawScatter = (effect as { amount: DynamicValue }).amount;
+      let n = resolveDynamicValue(rawScatter, ctx.rng, ctx.diceFloor) | 0;
+      if (typeof rawScatter === "object" && rawScatter !== null && typeof (rawScatter as { dice?: string }).dice === "string") {
+        ctx.diceRoll = n;
+      }
       while (n-- > 0) {
         const pool = dofuses.filter(
           (d) => d.currentLife > 0 && d.owner !== ctx.casterSide && !dofusInvulnerable(d, creatures),
@@ -430,7 +599,7 @@ export function applyEffect(
     //     (applyStatMod). Adding a new buff/debuff = one line here + maybe a
     //     STAT_FIELDS entry. ---
     case "Heal": {
-      const healAmount = resolveDynamicValue((effect as { amount: DynamicValue }).amount, ctx.rng, ctx.diceFloor);
+      const healAmount = resolveDynamicValue((effect as { amount: DynamicValue }).amount, ctx.rng, ctx.diceFloor, diceSink(log, ctx));
       // A single-target heal can land on a Dofus rather than a creature: Soin de Dofus #650
       // ("un Dofus") and Mot Reconstituant #491 ("une invocation OU un Dofus"). If the picked
       // cell has a Dofus and no creature, heal the Dofus, capped at its starting life (all
@@ -460,22 +629,22 @@ export function applyEffect(
         }
         return;
       }
-      applyStatMod(creatures, log, ctx, { field: "life", mode: "add", amount: healAmount, scope: scopeOf(effect), shape: shapeOf(effect), family: familyOf(effect), excludeSelf: excludeSelfOf(effect) });
+      applyStatMod(creatures, log, ctx, { field: "life", mode: "add", amount: healAmount, scope: scopeOf(effect), shape: shapeOf(effect), family: familyOf(effect), excludeSelf: excludeSelfOf(effect), drunk: drunkOf(effect), sober: soberOf(effect), minMovement: minMoveOf(effect) });
       return;
     }
     case "BoostAttack":
-      applyStatMod(creatures, log, ctx, { field: "attack", mode: "add", amount: resolveDynamicValue((effect as { amount: DynamicValue }).amount, ctx.rng, ctx.diceFloor), scope: scopeOf(effect), shape: shapeOf(effect), family: familyOf(effect), god: godOf(effect), excludeSelf: excludeSelfOf(effect), wounded: woundedOf(effect) });
+      applyStatMod(creatures, log, ctx, { field: "attack", mode: "add", amount: resolveDynamicValue((effect as { amount: DynamicValue }).amount, ctx.rng, ctx.diceFloor, diceSink(log, ctx)), scope: scopeOf(effect), shape: shapeOf(effect), family: familyOf(effect), god: godOf(effect), excludeSelf: excludeSelfOf(effect), wounded: woundedOf(effect), drunk: drunkOf(effect), sober: soberOf(effect), minMovement: minMoveOf(effect), minAttack: (effect as { minAttack?: number }).minAttack });
       return;
     case "BoostColumnAttack":
       // "Confère +N AT aux invocations d'une rangée" (Tikoko): the player picks
       // a cell; every creature on that RANGÉE, the vertical column (same x),
       // allies and enemies, gains +N AT. scope "all" + shape "column" reuses
       // the generic AoE path; targetCell (the clicked cell) supplies the column.
-      applyStatMod(creatures, log, ctx, { field: "attack", mode: "add", amount: resolveDynamicValue((effect as { amount: DynamicValue }).amount, ctx.rng, ctx.diceFloor), scope: "all", shape: "column", minAttack: (effect as { minAttack?: number }).minAttack });
+      applyStatMod(creatures, log, ctx, { field: "attack", mode: "add", amount: resolveDynamicValue((effect as { amount: DynamicValue }).amount, ctx.rng, ctx.diceFloor, diceSink(log, ctx)), scope: "all", shape: "column", minAttack: (effect as { minAttack?: number }).minAttack });
       return;
     case "BoostArmor": {
       const e = effect as { amount: DynamicValue; woundedAmount?: number };
-      let amount = resolveDynamicValue(e.amount, ctx.rng, ctx.diceFloor);
+      let amount = resolveDynamicValue(e.amount, ctx.rng, ctx.diceFloor, diceSink(log, ctx));
       // Single-target wounded-conditional amount (Saizan Zen #522: "+1 AR ou +2
       // si elle est blessée"). Read the picked target's state at resolve time,
       // like SetAttack toLife. Only meaningful single-target (no scope).
@@ -483,7 +652,7 @@ export function applyEffect(
         const tgt = creatures.find((x) => sameCoords(x.position, ctx.targetCell!) && x.currentLife > 0);
         if (tgt && tgt.currentLife < tgt.baseLife) amount = e.woundedAmount | 0;
       }
-      applyStatMod(creatures, log, ctx, { field: "armor", mode: "add", amount, scope: scopeOf(effect), shape: shapeOf(effect), family: familyOf(effect), god: godOf(effect), excludeSelf: excludeSelfOf(effect), wounded: woundedOf(effect) });
+      applyStatMod(creatures, log, ctx, { field: "armor", mode: "add", amount, scope: scopeOf(effect), shape: shapeOf(effect), family: familyOf(effect), god: godOf(effect), excludeSelf: excludeSelfOf(effect), wounded: woundedOf(effect), drunk: drunkOf(effect), sober: soberOf(effect), minMovement: minMoveOf(effect), minAttack: (effect as { minAttack?: number }).minAttack });
       return;
     }
     case "SetMovement":
@@ -494,7 +663,21 @@ export function applyEffect(
       // loses its whole armour pool.
       const t = ctx.targetCell;
       const tgt = t ? creatures.find((x) => sameCoords(x.position, t) && x.currentLife > 0) : undefined;
-      if (tgt) tgt.armor = 0;
+      if (!tgt) return;
+      const destroyed = tgt.armor;
+      tgt.armor = 0;
+      // gainAttack (V2 Larve Orange #116): the source gains as much AT as the
+      // armour destroyed, permanently, hence baseAttack, which survives the reset
+      // at the start of the turn (same write as AddArmorToAttack).
+      // Zero armour destroyed = zero AT gained, and the target can belong to
+      // either side.
+      if ((effect as { gainAttack?: boolean }).gainAttack && destroyed > 0) {
+        const me = findSelf(creatures, ctx);
+        if (me) {
+          me.currentAttack += destroyed;
+          me.baseAttack += destroyed;
+        }
+      }
       return;
     }
     case "AttractCreature": {
@@ -507,7 +690,7 @@ export function applyEffect(
       return;
     }
     case "BoostMovement":
-      applyStatMod(creatures, log, ctx, { field: "movement", mode: "add", amount: (effect as { amount: number }).amount | 0, scope: scopeOf(effect), shape: shapeOf(effect), family: familyOf(effect), excludeSelf: excludeSelfOf(effect) });
+      applyStatMod(creatures, log, ctx, { field: "movement", mode: "add", amount: (effect as { amount: number }).amount | 0, scope: scopeOf(effect), shape: shapeOf(effect), family: familyOf(effect), excludeSelf: excludeSelfOf(effect), drunk: drunkOf(effect), sober: soberOf(effect), minMovement: minMoveOf(effect) });
       return;
     case "SetAttack": {
       // "Passe l'AT à N" (value), or, for Acide Sandoz, "AT égale à ses PV
@@ -544,7 +727,7 @@ export function applyEffect(
       return;
     }
     case "BoostRange":
-      applyStatMod(creatures, log, ctx, { field: "range", mode: "add", amount: resolveDynamicValue((effect as { amount: DynamicValue }).amount, ctx.rng, ctx.diceFloor), scope: scopeOf(effect), shape: shapeOf(effect) });
+      applyStatMod(creatures, log, ctx, { field: "range", mode: "add", amount: resolveDynamicValue((effect as { amount: DynamicValue }).amount, ctx.rng, ctx.diceFloor, diceSink(log, ctx)), scope: scopeOf(effect), shape: shapeOf(effect) });
       return;
     case "SetLife":
       // "Fait chuter à N les PV", set life to an exact value (reuses the life
@@ -556,10 +739,20 @@ export function applyEffect(
       handleHealFull(creatures, log, ctx, scopeOf(effect));
       return;
 
-    case "SetRange":
+    case "SetRange": {
       // "Supprime la portée", set range to `max` (0 = melee again).
-      applyStatMod(creatures, log, ctx, { field: "range", mode: "set", amount: (effect as { max: number }).max | 0 });
+      const wanted = (effect as { max: number }).max | 0;
+      // onlyIfLower (V2 Oeil de Lynx #388): the spell gives a range, it never
+      // lowers one. On a shooter that already has as much or more it does
+      // nothing; without this guard, casting it on a 1-3 would bring it down to 1-2.
+      if ((effect as { onlyIfLower?: boolean }).onlyIfLower) {
+        const t = ctx.targetCell;
+        const tgt = t ? creatures.find((x) => sameCoords(x.position, t) && x.currentLife > 0) : undefined;
+        if (!tgt || tgt.range >= wanted) return;
+      }
+      applyStatMod(creatures, log, ctx, { field: "range", mode: "set", amount: wanted });
       return;
+    }
     case "MultiplyAttack":
       handleMultiplyAttack(creatures, log, effect as { factor: number }, ctx);
       return;
@@ -609,7 +802,7 @@ export function applyEffect(
     case "AoeDamage": {
       // amount may be a die (Dé Rebondissant #573 "1d6 aux invocations adverses"),
       // one roll for the whole AoE, honouring Dé Pipé's floor.
-      const amt = resolveDynamicValue((effect as { amount: number | DynamicValue }).amount, ctx.rng, ctx.diceFloor) | 0;
+      const amt = resolveDynamicValue((effect as { amount: number | DynamicValue }).amount, ctx.rng, ctx.diceFloor, diceSink(log, ctx)) | 0;
       handleAoeDamage(creatures, log, ctx, amt, scopeOf(effect), shapeOf(effect), (effect as { zone?: "ownCamp" | "enemyCamp" }).zone, (effect as { minAttack?: number }).minAttack, (effect as { excludeTargetCreature?: boolean }).excludeTargetCreature);
       return;
     }
@@ -709,6 +902,23 @@ export function applyEffect(
     case "AoePush":
       handleAoePush(creatures, dofuses, log, ctx, (effect as { distance: number }).distance | 0, scopeOf(effect), shapeOf(effect));
       return;
+    case "WeakenFirstEnemyAhead":
+      handleWeakenFirstEnemyAhead(creatures, log, ctx,
+        resolveDynamicValue((effect as { amount: DynamicValue }).amount, ctx.rng, ctx.diceFloor, diceSink(log, ctx)) | 0,
+        (effect as { duration?: string }).duration);
+      return;
+    case "ReduceDofusDamage": {
+      // On the five Dofus of the caster, never the opponent's. Cumulative: two
+      // copies played in the same turn reduce by 2 (the same reading as the sum
+      // of the SpellDamageReductionAura of the pool).
+      const n = Math.max(0, ((effect as { amount?: number }).amount ?? 0) | 0);
+      if (n > 0) {
+        for (const d of dofuses) {
+          if (d.owner === ctx.casterSide) d.damageReduction = (d.damageReduction ?? 0) + n;
+        }
+      }
+      return;
+    }
     case "AttractFirstAhead":
       handleAttractFirstAhead(creatures, dofuses, log, ctx);
       return;
@@ -729,7 +939,7 @@ export function applyEffect(
       return;
     }
     case "DestroyInFront":
-      handleDestroyInFront(creatures, log, ctx, effect as { maxAttack?: number });
+      handleDestroyInFront(creatures, log, ctx, effect as { maxAttack?: number; enemyOnly?: boolean });
       return;
     case "DamageInFront":
       handleDamageInFront(creatures, dofuses, log, ctx, effect as { type: "DamageInFront"; amount: DynamicValue; hitDofus?: boolean });
@@ -748,6 +958,50 @@ export function applyEffect(
       handleCharge(creatures, log, effect as { cells: number | "toWall" }, ctx);
       return;
 
+    case "DamageFirstEnemyAheadPerFamily": {
+      // "Vos <famille> infligent N dégâts à la première invocation adverse de
+      // leur ligne": each living carrier of the caster's side sweeps its lane
+      // (same y) towards the opponent's side and hits the closest enemy creature;
+      // allies do not block, only enemies count.
+      // One volley per carrier, and nothing if the lane has no enemy: the Dofus
+      // is never hit.
+      const ef = effect as { family: string; amount: number };
+      const dmg = ef.amount | 0;
+      if (dmg > 0) {
+        const tireurs = creatures.filter(
+          (c) => c.currentLife > 0 && c.owner === ctx.casterSide && !c.silenced && famsOf(c).includes(ef.family),
+        );
+        for (const me of tireurs) {
+          const dx = me.owner === "ally" ? -1 : 1;
+          let cible: CreatureInstance | undefined;
+          let best = Infinity;
+          for (const c of creatures) {
+            if (c.currentLife <= 0 || c.owner === me.owner || c.position.y !== me.position.y) continue;
+            const devant = (c.position.x - me.position.x) * dx;
+            if (devant > 0 && devant < best) { best = devant; cible = c; }
+          }
+          if (!cible) continue;
+          const armorBefore = cible.armor;
+          const lifeBefore = cible.currentLife;
+          dealSpellDamageThroughGuard(cible, dmg, log, creatures, me.instanceId, ctx.casterSide);
+          if (cible.currentLife < lifeBefore || cible.armor < armorBefore) {
+            log.push({
+              type: "DAMAGE",
+              sourceInstanceId: me.instanceId,
+              targetInstanceId: cible.instanceId,
+              damage: lifeBefore - cible.currentLife,
+              armorHit: armorBefore > cible.armor,
+            });
+          }
+        }
+      }
+      return;
+    }
+    case "RecoverSelfSpell":
+      // A plain marker: castSpell reads it after the resolution to send the
+      // spell back to the hand. Nothing to do here, but the case must exist so
+      // that the marker does not fall into the "unknown type" branch.
+      return;
     case "NoOp":
       // Poils de Jiji #281: a junk card with no effect, playing it just discards it.
       return;
@@ -796,7 +1050,7 @@ export function applyEffect(
       if (!ctx.targetCell) return;
       const tgt = creatures.find((c) => sameCoords(c.position, ctx.targetCell!) && c.currentLife > 0);
       if (!tgt) return;
-      const amount = resolveDynamicValue((effect as { Value: DynamicValue }).Value, ctx.rng, ctx.diceFloor) | 0;
+      const amount = resolveDynamicValue((effect as { Value: DynamicValue }).Value, ctx.rng, ctx.diceFloor, diceSink(log, ctx)) | 0;
       if (amount !== 0) tgt.movementPoison = Math.max(0, tgt.movementPoison + amount);
       return;
     }
@@ -849,13 +1103,13 @@ export function applyEffects(
 // logged during this applyEffects pass whose owner controls a living Dargone, the enemy
 // on Dargone's row closest to Dargone with at least minAt AT loses N AT.
 function applyHealReactions(creatures: CreatureInstance[], dofuses: DofusInstance[], log: GameEvent[], logStart: number): void {
-  const dargones = creatures.filter((c) => c.currentLife > 0 && (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "ReduceFirstEnemyAtOnAllyHeal"));
+  const dargones = creatures.filter((c) => c.currentLife > 0 && (effsOf(c)).some((e) => e.type === "ReduceFirstEnemyAtOnAllyHeal"));
   // Malox Makugen #76: "inflige N au dofus adverse de sa ligne quand UNE invocation est soignée"
   // reacts to any creature healed (both sides), striking the enemy Dofus on Malox's own row.
-  const maloxes = creatures.filter((c) => c.currentLife > 0 && (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "DamageDofusOnRowOnHeal"));
+  const maloxes = creatures.filter((c) => c.currentLife > 0 && (effsOf(c)).some((e) => e.type === "DamageDofusOnRowOnHeal"));
   // Pacificatrice Enjouée #1519: "inflige N dégât aux invocations ADVERSES quand une invocation
   // ALLIÉE est soignée", reacts only to an ally heal, hitting every enemy creature (not Dofus).
-  const pacifs = creatures.filter((c) => c.currentLife > 0 && (getCard(c.cardId)?.effects ?? []).some((e) => e.type === "DamageEnemiesOnAllyHeal"));
+  const pacifs = creatures.filter((c) => c.currentLife > 0 && (effsOf(c)).some((e) => e.type === "DamageEnemiesOnAllyHeal"));
   if (dargones.length === 0 && maloxes.length === 0 && pacifs.length === 0) return;
   for (let i = logStart; i < log.length; i++) {
     const ev = log[i] as { type: string; instanceId?: number };
@@ -864,7 +1118,7 @@ function applyHealReactions(creatures: CreatureInstance[], dofuses: DofusInstanc
     if (!healed || healed.currentLife <= 0) continue; // a Dofus heal has no creature
     for (const m of maloxes) {
       if (m.currentLife <= 0) continue;
-      const mk = (getCard(m.cardId)?.effects ?? []).find((e) => e.type === "DamageDofusOnRowOnHeal") as { amount?: number } | undefined;
+      const mk = (effsOf(m)).find((e) => e.type === "DamageDofusOnRowOnHeal") as { amount?: number } | undefined;
       const amount = mk?.amount ?? 1;
       const dof = dofuses.find((o) => o.currentLife > 0 && o.owner !== m.owner && o.position.y === m.position.y);
       if (!dof || dofusInvulnerable(dof, creatures)) continue; // Artheon #1424
@@ -874,7 +1128,7 @@ function applyHealReactions(creatures: CreatureInstance[], dofuses: DofusInstanc
     }
     for (const d of dargones) {
       if (d.currentLife <= 0 || healed.owner !== d.owner) continue;
-      const mk = (getCard(d.cardId)?.effects ?? []).find((e) => e.type === "ReduceFirstEnemyAtOnAllyHeal") as { amount?: number; minAt?: number } | undefined;
+      const mk = (effsOf(d)).find((e) => e.type === "ReduceFirstEnemyAtOnAllyHeal") as { amount?: number; minAt?: number } | undefined;
       const amount = mk?.amount ?? 1, minAt = mk?.minAt ?? 0;
       const enemies = creatures.filter((c) => c.currentLife > 0 && c.owner !== d.owner && c.position.y === d.position.y && c.currentAttack >= minAt);
       if (enemies.length === 0) continue;
@@ -892,7 +1146,7 @@ function applyHealReactions(creatures: CreatureInstance[], dofuses: DofusInstanc
       // shape as handleAoeDamage. Fires once per ally-heal event (an AoE heal of 2
       // allies → two sprays). A dead enemy from an earlier spray is skipped (life ≤ 0).
       if (p.currentLife <= 0 || healed.owner !== p.owner) continue;
-      const mk = (getCard(p.cardId)?.effects ?? []).find((e) => e.type === "DamageEnemiesOnAllyHeal") as { amount?: number } | undefined;
+      const mk = (effsOf(p)).find((e) => e.type === "DamageEnemiesOnAllyHeal") as { amount?: number } | undefined;
       const amount = mk?.amount ?? 1;
       for (const enemy of creatures) {
         if (enemy.currentLife <= 0 || enemy.owner === p.owner) continue;
@@ -923,10 +1177,13 @@ export function effectRequiresTarget(eff: Effect): boolean {
   if (eff.type === "SwapSourceMovement") return true;
   // Larve Orange's APPARITION: the player picks a creature whose armour is wiped.
   if (eff.type === "DestroyArmor") return true;
+  // Alfonse Dé (Pandawa god): the player picks the Pandawa whose drunkenness toggles.
+  if (eff.type === "ToggleDrunk") return true;
   if (eff.type === "AttractCreature") return true; // Chacha Tyran #943: pick the creature to pull
   if (eff.type === "MoveAdjacentRowRandom") return true; // Larve Verte #139: pick the creature to teleport to a random adjacent row
   if (eff.type === "CopyFamilyFromTarget") return true; // Pupuce #441: pick the creature whose family the source adopts
   if (eff.type === "TutorCopyOfTarget") return true; // Wabbit en Chocolat #733: pick the creature whose copy is pulled from the deck
+  if (eff.type === "CopyTextFromTarget") return true; // Anathar #316 (V2): pick the ENEMY creature whose text the source adopts
   // Phaeris' APPARITION ("silence les invocations d'UNE ligne"): a shaped silence
   // needs a pick to choose which line, the targetCell anchors the row/column.
   // Exception: `selfAnchored` (Frondeur Nimbos #1168 "les autres invocations de SA ligne")
@@ -977,6 +1234,19 @@ export function effectRequiresTarget(eff: Effect): boolean {
   // an empty cell of their camp. (On the #691 Tas d'Os AOE card the cast cell is the
   // target, castSpell applies the effect directly, never consulting this.)
   if (eff.type === "PlaceTasDOs") return true;
+  // Butin placed by a trigger (V2 Erik Rak #720 APPARITION): the player chooses the cell, on
+  // either side. Strictly tied to `pickCell`: without it PlaceButin keeps its V1 path (spells
+  // #789 / #1382 / #1104: the cast cell is the target, castSpell never looks at this function).
+  // No card of the V1 catalogue carries PlaceButin in a `trigger`.
+  if (eff.type === "PlaceButin") return !!(eff as { pickCell?: string }).pickCell;
+  // Tas d'Os: "Transformez UN tas d'os allié" (#738) = the player chooses which one.
+  // #147 Roi Chafer carries all:true ("TOUS les tas d'os"), so there is no choice.
+  if (eff.type === "TransformTasDOs") return !(eff as { all?: boolean }).all;
+  // "Détruisez UN tas d'os allié" (#223 self, #626 chafers) = a pick as well.
+  // Required: ConsumeTasDOsBuff carries a `scope` field ("self"/"chafers") that is not an AoE
+  // zone, so this test must stay before the `scope` shortcut below, otherwise the pick is
+  // never asked.
+  if (eff.type === "ConsumeTasDOsBuff") return true;
   // Any scoped effect is an AoE applied to a whole side/area, no pick needed.
   if ((eff as { scope?: string }).scope) return false;
   switch (eff.type) {
@@ -1031,7 +1301,7 @@ export function effectRequiresTarget(eff: Effect): boolean {
 // validation.
 export function effectTargetFilter(
   eff: Effect,
-): { filter: "enemy_creature" | "wounded_enemy_creature" | "ally_creature" | "any_creature" | "any_dofus" | "any_cell" | "own_seed" | "own_empty_camp" | "own_summon_cell" | "any_prism" | "ally_prism" | "enemy_prism" | "own_prismless_first_col" | "board_object" | "ally_dofus" | "ally_dofus_no_equipment" | "enemy_dofus" | "ally_glyph" | "destroyed_ally_dofus" | "enemy_unrevealed_dofus"; prompt: string } {
+): { filter: "enemy_creature" | "copyable_enemy_creature" | "wounded_enemy_creature" | "ally_creature" | "any_creature" | "any_dofus" | "any_cell" | "own_seed" | "own_tas_dos" | "own_empty_camp" | "free_cell_any_camp" | "own_summon_cell" | "any_prism" | "ally_prism" | "enemy_prism" | "prism_in_enemy_camp" | "own_prismless_first_col" | "board_object" | "ally_dofus" | "ally_dofus_no_equipment" | "enemy_dofus" | "ally_glyph" | "destroyed_ally_dofus" | "enemy_unrevealed_dofus"; prompt: string } {
   if (eff.type === "Heal" && (eff as { dofus?: boolean }).dofus) {
     return { filter: "any_dofus", prompt: "Choisissez un Dofus à soigner." };
   }
@@ -1046,6 +1316,12 @@ export function effectTargetFilter(
     return (eff as { pickSide?: string }).pickSide === "enemy"
       ? { filter: "enemy_creature", prompt: "Choisissez une invocation adverse à renvoyer." }
       : { filter: "ally_creature", prompt: "Choisissez une de vos invocations à renvoyer en main." };
+  }
+  if (eff.type === "ToggleDrunk") {
+    // Alfonse Dé (Pandawa god): "un Pandawa ALLIÉ". Without this case, the any_cell
+    // fallback made an enemy Pandawa targetable, and a click on an empty cell used up
+    // the trigger. The family is already narrowed by pickFamily.
+    return { filter: "ally_creature", prompt: "Choisissez un Pandawa allié à saouler ou dégriser." };
   }
   if (eff.type === "DestroyPrism") {
     return { filter: "any_prism", prompt: "Choisissez un prisme à détruire." };
@@ -1074,6 +1350,13 @@ export function effectTargetFilter(
     return { filter: "ally_creature", prompt: "Choisissez l'invocation alliée à blesser pour invoquer (cliquez hors du terrain pour annuler)." };
   }
   if (eff.type === "RamasserPrisme") {
+    // V2 Malocac #85 "Récupérez un prisme dans le camp adverse": `inZone` replaces the owner
+    // criterion by a position criterion, so it is tested first and takes priority over `side`,
+    // exactly as in the pool filter of RamasserPrisme (rules.ts), since both must name the same
+    // set of prisms.
+    if ((eff as { inZone?: string }).inZone === "enemyCamp") {
+      return { filter: "prism_in_enemy_camp", prompt: "Choisissez un prisme dans le camp adverse à récupérer (cliquez ailleurs pour ne rien récupérer, ou hors du terrain pour annuler la pose)." };
+    }
     // `side` restricts which prisms are pickable: Malocac #85 "un prisme ADVERSE" → enemy_prism,
     // an ally-only pickup → ally_prism, else any prism (Lou #521 "un prisme").
     const side = (eff as { side?: string }).side;
@@ -1122,11 +1405,23 @@ export function effectTargetFilter(
   if (eff.type === "TransformSeed" || eff.type === "TransformSeedToBush") {
     return { filter: "own_seed", prompt: "Choisissez une de vos graines à transformer." };
   }
+  if (eff.type === "TransformTasDOs") {
+    return { filter: "own_tas_dos", prompt: "Choisissez un de vos tas d'os à transformer en Chafer Décrépit." };
+  }
+  if (eff.type === "ConsumeTasDOsBuff") {
+    return { filter: "own_tas_dos", prompt: "Choisissez un de vos tas d'os à détruire." };
+  }
   if (eff.type === "PlaceGlyph") {
     return { filter: "own_empty_camp", prompt: "Choisissez une case vide de votre camp pour le Glyphe." };
   }
   if (eff.type === "PlaceTasDOs") {
     return { filter: "own_empty_camp", prompt: "Choisissez une case vide de votre camp pour le Tas d'Os." };
+  }
+  if (eff.type === "PlaceButin" && (eff as { pickCell?: string }).pickCell) {
+    // V2 Erik Rak #720: no side restriction, unlike Trouvaille #1382 / #789, which place
+    // "dans votre camp". A prism on the cell is accepted: the placement replaces it, which is
+    // the whole point of the free choice.
+    return { filter: "free_cell_any_camp", prompt: "Choisissez une case libre ou poser le Butin (n'importe quel camp)." };
   }
   switch (eff.type) {
     case "PushData":
@@ -1145,6 +1440,8 @@ export function effectTargetFilter(
       return { filter: "any_creature", prompt: "Choisissez une invocation à déplacer sur une ligne adjacente." };
     case "CopyFamilyFromTarget":
       return { filter: "any_creature", prompt: "Choisissez l'invocation dont copier la famille." };
+    case "CopyTextFromTarget":
+      return { filter: "copyable_enemy_creature", prompt: "Choisissez l'invocation adverse dont copier le texte." };
     case "TutorCopyOfTarget":
       return { filter: "any_creature", prompt: "Choisissez l'invocation dont tirer une copie de la pioche." };
     case "Heal":
@@ -1235,8 +1532,11 @@ export function effectTargetFilter(
 // reason): if `victim` is protected by a living bodyguard, return it so spell damage is
 // dealt to the bodyguard instead; otherwise return `victim` unchanged.
 function guardOfSpell(victim: CreatureInstance, creatures: CreatureInstance[]): CreatureInstance {
-  if (victim.protectedByGuard == null) return victim;
-  const g = creatures.find((c) => c.instanceId === victim.protectedByGuard && c.currentLife > 0);
+  // Silencing the guard or the protected creature cuts the link. This is a deliberate
+  // exception to "silence cuts what a creature gives, not what it receives", so do not
+  // derive it from the general rule, it contradicts it.
+  if (victim.protectedByGuard == null || victim.silenced) return victim;
+  const g = creatures.find((c) => c.instanceId === victim.protectedByGuard && c.currentLife > 0 && !c.silenced);
   return g && g.instanceId !== victim.instanceId ? g : victim;
 }
 
@@ -1247,7 +1547,7 @@ function guardOfSpell(victim: CreatureInstance, creatures: CreatureInstance[]): 
 // takes 1. (`dealt` is the post-shield/résistance/armure life damage and currentLife is left
 // unclamped by applyDamageToCreatureFromSpell, so `dealt - lifeBefore` is exactly the overflow.)
 // Logs DAMAGE / FIGHT_OBJECT_REMOVED for each creature actually hit.
-function dealSpellDamageThroughGuard(
+export function dealSpellDamageThroughGuard(
   victim: CreatureInstance,
   dmg: number,
   log: GameEvent[],
@@ -1284,7 +1584,7 @@ function sumSpellDamageReduction(creatures: CreatureInstance[], ownerSide: Side)
   let reduction = 0;
   for (const c of creatures) {
     if (c.currentLife <= 0 || c.owner !== ownerSide) continue;
-    const a = (getCard(c.cardId)?.effects ?? []).find((e) => e.type === "SpellDamageReductionAura") as { amount?: number } | undefined;
+    const a = (effsOf(c)).find((e) => e.type === "SpellDamageReductionAura") as { amount?: number } | undefined;
     if (a) reduction += a.amount ?? 0;
   }
   return reduction;
@@ -1349,6 +1649,7 @@ function applyDamageToCreatureFromSpell(
   if (target.properties.has("Stunned")) {
     target.properties = new Set(target.properties); // clone before mutating the shared Set (aliasing)
     target.properties.delete("Stunned");
+    target.stunTurns = undefined; // "annule tout le compteur", as on the combat path
     log.push({ type: "PROPERTY_UNAPPLIED", instanceId: target.instanceId, property: "Stunned" });
   }
   // Vulnérabilité raises the hit, Résistance lowers it, both flat.
@@ -1400,13 +1701,22 @@ const mod = (valueBefore: number, valueAfter: number) => ({
   valueAfter,
 });
 
-const STAT_FIELDS: Record<"life" | "attack" | "armor" | "movement" | "range", StatField> = {
+const STAT_FIELDS: Record<"life" | "attack" | "armor" | "movement" | "range" | "resistance", StatField> = {
   // Heal: raises currentLife only (baseLife = the cap), never overheals.
   life: {
     read: (c) => c.currentLife,
     write: (c, _b, after) => { c.currentLife = after; },
     cap: (c) => c.baseLife,
     event: (c, b, a) => ({ type: "LIFE_HEALED", instanceId: c.instanceId, heal: a - b, lifeMod: mod(b, a) }),
+  },
+  // Resistance: a flat reduction taken off each instance of damage (separate from
+  // AR, which is a pool that gets used up). It persists as it is: withAuras only
+  // resets `auraResistance`, never the base resistance (Lien Spiritueux).
+  resistance: {
+    read: (c) => c.resistance,
+    write: (c, _b, after) => { c.resistance = Math.max(0, after); },
+    cap: () => Number.MAX_SAFE_INTEGER,   // no cap on resistance
+    event: (c, b, a) => ({ type: "PROPERTY_APPLIED", instanceId: c.instanceId, property: `Resistance${a - b >= 0 ? "+" : ""}${a - b}` }),
   },
   // Attack: persistent, currentAttack and baseAttack move by the same delta.
   attack: {
@@ -1531,18 +1841,25 @@ function scopeMatches(c: CreatureInstance, scope: Scope, casterSide: "ally" | "e
 //   column, "rangée": every cell of the targeted vertical column (same x).
 //   cross, the targeted row and column ("la ligne et la rangée").
 //   around, the targeted cell and its 8 neighbours ("autour").
-type AoeShape = "row" | "column" | "cross" | "around";
+// In line with `AoeShape` in data/types.ts: "beside" = the 2 side cells of the
+// target, same row (Flasque Explosive).
+type AoeShape = "row" | "column" | "cross" | "around" | "beside";
 function inShape(c: CreatureInstance, t: Coords, shape: AoeShape): boolean {
   switch (shape) {
     case "row": return c.position.y === t.y;       // ligne (horizontal)
     case "column": return c.position.x === t.x;    // rangée (vertical)
     case "cross": return c.position.x === t.x || c.position.y === t.y;
     case "around": return Math.abs(c.position.x - t.x) <= 1 && Math.abs(c.position.y - t.y) <= 1;
+    // "celles à côté" = the 2 side cells of the targeted cell: same row (same x),
+    // one line above and one below. The reading used for Flasque Explosive ("like
+    // Boo"), and the one the engine already carries under the property
+    // DamagesOn3CellsSameColumn of Marteleur Nimbos #972.
+    case "beside": return c.position.x === t.x && Math.abs(c.position.y - t.y) === 1;
   }
 }
 function shapeOf(effect: Effect): AoeShape | undefined {
   const s = (effect as { shape?: string }).shape;
-  return s === "row" || s === "column" || s === "cross" || s === "around" ? s : undefined;
+  return s === "row" || s === "column" || s === "cross" || s === "around" || s === "beside" ? s : undefined;
 }
 
 // Dispatch a stat effect: AoE when the effect has a `scope`, otherwise the single
@@ -1563,7 +1880,10 @@ function applyStatMod(
   creatures: CreatureInstance[],
   log: GameEvent[],
   ctx: EffectContext,
-  opts: { field: keyof typeof STAT_FIELDS; mode: "add" | "set"; amount: number; scope?: Scope; shape?: AoeShape; family?: string; god?: string; excludeSelf?: boolean; wounded?: boolean; minAttack?: number },
+  opts: { field: keyof typeof STAT_FIELDS; mode: "add" | "set"; amount: number; scope?: Scope; shape?: AoeShape; family?: string; god?: string; excludeSelf?: boolean; wounded?: boolean; minAttack?: number;
+         // Pandawa god: "ayant au moins N PM" (Engourdissement) and the
+         // drunkenness sub-filters (Tournée Générale, Ivresse de la Bataille).
+         minMovement?: number; drunk?: boolean; sober?: boolean },
 ): void {
   // Sangsuce Tsu Tsu #24: a positive life-add (a heal) becomes spell damage of the same amount while a
   // HealingsDoDamageInstead carrier is alive (both camps). Other stat mods are untouched.
@@ -1592,6 +1912,10 @@ function applyStatMod(
       if (opts.god && getCard(c.cardId)?.god !== opts.god) continue; // "vos autres Xélors" (Synchroniseur #714)
       if (opts.wounded && c.currentLife >= c.baseLife) continue; // "blessées" only
       if (opts.minAttack != null && c.currentAttack < opts.minAttack) continue; // "ayant au moins N AT"
+      if (opts.minMovement != null && c.baseMovement < opts.minMovement) continue; // "ayant au moins N PM" (Engourdissement)
+      // Pandawa god: "vos Pandawas saouls" / "vos invocations sobres"
+      if (opts.drunk && !c.properties.has(SAOUL)) continue;
+      if (opts.sober && c.properties.has(SAOUL)) continue;
       apply(c);
     }
     return;
@@ -1677,6 +2001,46 @@ function handleAoePush(
 // find the nearest enemy ahead of the source on its own row, then pull it toward the source until
 // it is adjacent in front (slideCreatureBack towardSide = source's side → it slides into the source's
 // wall direction and stops one cell before the source). A following ChargeSelf then charges into it.
+// Champion Assoiffé #2005 "Réduit de N l'AT de la première invocation ENNEMIE devant lui
+// jusqu'à votre prochain tour", automatic (no pick). Same reading of "devant" as
+// handleAttractFirstAhead below: the carrier's lane (same y), towards the opponent's side,
+// skipping allies and taking the first enemy.
+// The reversion is measured on the stat really taken and not on -amount: mutateStat
+// clamps at 0, so a creature with 1 AT only gives back 1 point, not N. Without it, a
+// malus of 2 on a creature with 1 AT would give it a permanent +1.
+function handleWeakenFirstEnemyAhead(
+  creatures: CreatureInstance[],
+  log: GameEvent[],
+  ctx: EffectContext,
+  amount: number,
+  duration: string | undefined,
+): void {
+  const me = findSelf(creatures, ctx);
+  if (!me || amount <= 0) return;
+  const dx = me.owner === "ally" ? -1 : 1;
+  let cible: CreatureInstance | undefined;
+  let best = Infinity;
+  for (const c of creatures) {
+    if (c.currentLife <= 0 || c.owner === me.owner || c.position.y !== me.position.y) continue;
+    const devant = (c.position.x - me.position.x) * dx;
+    if (devant > 0 && devant < best) { best = devant; cible = c; }
+  }
+  if (!cible) return;
+  const avant = readStat(cible, "attack");
+  mutateStat(cible, log, "attack", "add", -amount);
+  const encaisse = avant - readStat(cible, "attack");
+  if (encaisse > 0 && duration && ctx.tempReversionSink) {
+    ctx.tempReversionSink.push({
+      kind: "stat",
+      expireSide: duration === "opponentNextTurn" ? (me.owner === "ally" ? "enemy" : "ally") : me.owner,
+      field: "attack",
+      amount: encaisse,
+      instanceIds: [cible.instanceId],
+    });
+  }
+}
+
+
 function handleAttractFirstAhead(
   creatures: CreatureInstance[],
   dofuses: DofusInstance[],
@@ -1774,6 +2138,21 @@ function handleGrantProperty(
   const prop = effect.property;
   if (!prop) return;
   const add = (c: CreatureInstance) => {
+    // Drunk state (Pandawa god): only Pandawas can be drunk, every other creature is
+    // always sober, so the placement is refused.
+    if (prop === SAOUL && !famsOf(c).includes("Pandawa")) return;
+    // Stun duration: "Assomme une invocation pour N tour(s)". Absent = 1, the old
+    // behaviour. Fiole de Pandapiler puts its FERMENTATION there.
+    if (prop === "Stunned") {
+      const t = (effect as { turns?: number }).turns;
+      if (typeof t === "number" && t > 1) c.stunTurns = t | 0;
+    }
+    // Making an already drunk Pandawa drunk again is a complete no-op. A Picole can be cast
+    // on a drunk Pandawa, but it has no effect: the Pandawa stays drunk and, above all, the
+    // triggers of Pandawas that become drunk do not fire. So the target stays legal (no
+    // sobriety filter on the caster), it just has no effect. Without the PROPERTY_APPLIED
+    // emitted again here, the reading of the log that arms the "SAOUL : …" sees nothing,
+    // which is the point.
     if (c.properties.has(prop)) return;
     c.properties = new Set(c.properties); // clone before mutating the shared Set (aliasing)
     c.properties.add(prop);
@@ -1886,6 +2265,12 @@ export function transformCreature(c: CreatureInstance, tokenId: number, owner: S
   }
   c.cardId = token.id;
   c.owner = owner;
+  // Drunkenness does not survive a transform; the properties are replaced anyway by
+  // those of the new form below. But the FERMENTATION set on the creature and the
+  // stun duration must be cleared explicitly: a stale `stunTurns` would make a later
+  // stun last longer.
+  c.ferment = undefined;
+  c.stunTurns = undefined;
   c.currentLife = token.life ?? 1;
   c.baseLife = token.life ?? 1;
   c.printedLife = token.life ?? 1;
@@ -1918,6 +2303,7 @@ export function transformCreature(c: CreatureInstance, tokenId: number, owner: S
   c.movementPoison = 0;
   c.silenced = false;
   c.costOverride = undefined;
+  c.textCardId = undefined; // Anathar #316: the new form takes its own text (c.triggers was just replaced by the token's)
   // Clear the old aura accumulators inherited from the previous card. withAuras step 1 strips
   // these back out of base/range on every recompute; if they survived the rebuild they would be
   // subtracted again from the new token's printed stats, dropping it below them once the old buff
@@ -1928,6 +2314,7 @@ export function transformCreature(c: CreatureInstance, tokenId: number, owner: S
   c.auraRange = 0;
   c.auraMovement = 0;
   c.auraResistance = 0;
+  c.auraVulnerability = 0; // `vulnerability` was just reset to 0 above, the accumulator follows
   // Transformation beat: a transformation is neither a death nor a summon. The replay swaps the
   // figurine in place with the gen_transformation effect (and its sound) at this beat, then skips
   // the spawn animation of the NEW_SUMMON that follows (kept, since it carries the final state for
@@ -1939,7 +2326,7 @@ export function transformCreature(c: CreatureInstance, tokenId: number, owner: S
 function handleTransform(
   creatures: CreatureInstance[],
   log: GameEvent[],
-  effect: { tokenId?: number; randomCost?: number; asOwner: "caster" | "keep"; attack?: number; life?: number; cost?: number },
+  effect: { tokenId?: number; randomCost?: number | "target"; asOwner: "caster" | "keep"; attack?: number; life?: number; cost?: number },
   ctx: EffectContext,
 ): void {
   if (!ctx.targetCell) return;
@@ -1950,7 +2337,13 @@ function handleTransform(
   // fixed tokenId.
   let tokenId = effect.tokenId;
   if (effect.randomCost != null) {
-    const pool = summonsOfCost(effect.randomCost);
+    // randomCost "target" (V2 Otomaï #102 "en une autre invocation aléatoire au MÊME
+    // COÛT en PA"): the cost read is the one printed on the target's card, never its
+    // current cost. A reduction already applied (Vampyro, Nox…) does not move the pool,
+    // the same rule as Coqueline, which always fetches a 2 AP creature.
+    const wantCost = effect.randomCost === "target" ? getCard(c.cardId)?.cost : effect.randomCost;
+    if (wantCost == null) return;
+    const pool = summonsOfCost(wantCost);
     if (pool.length === 0) return;
     tokenId = pool[requireRng(ctx.rng, "un Transform aléatoire").int(pool.length)];
   }
@@ -2061,7 +2454,7 @@ function handleDestroyInFront(
   creatures: CreatureInstance[],
   log: GameEvent[],
   ctx: EffectContext,
-  effect: { maxAttack?: number },
+  effect: { maxAttack?: number; enemyOnly?: boolean },
 ): void {
   const me = findSelf(creatures, ctx);
   if (!me) return;
@@ -2070,7 +2463,13 @@ function handleDestroyInFront(
   let target: CreatureInstance | undefined;
   for (let x = me.position.x + dx; x >= 0 && x < BOARD_COLS; x += dx) {
     const c = creatures.find((o) => o.currentLife > 0 && o.position.x === x && o.position.y === y);
-    if (c) { target = c; break; }
+    if (!c) continue;
+    // enemyOnly (V2 Gloutoblop #314): an allied creature does not block the lane, it
+    // is crossed and the search goes on. Without the flag, the first creature met
+    // stays the target, ally included: the V1 behaviour, unchanged.
+    if (effect.enemyOnly && c.owner === me.owner) continue;
+    target = c;
+    break;
   }
   if (!target) return;
   if (effect.maxAttack != null && target.currentAttack > effect.maxAttack) return;
@@ -2095,7 +2494,7 @@ function handleDamageInFront(
 ): void {
   const me = findSelf(creatures, ctx);
   if (!me) return;
-  const dmg = resolveDynamicValue(effect.amount, ctx.rng, ctx.diceFloor);
+  const dmg = resolveDynamicValue(effect.amount, ctx.rng, ctx.diceFloor, diceSink(log, ctx));
   if (dmg <= 0) return;
   const dx = me.owner === "ally" ? -1 : 1;
   const y = me.position.y;
@@ -2121,7 +2520,14 @@ function handleDamageInFront(
     }
     return;
   }
-  dealSpellDamageThroughGuard(target, dmg, log, creatures, me.instanceId, ctx.casterSide); // Garde du corps #320/#300 (overflow past the bodyguard)
+  // isSpell = false: DamageInFront is always a creature ability. The six carriers of the
+  // catalogue (#564 Zespadon, #775 Cancane, #920 Héros Chataîgneur, #1108 Guerrier Boudeur,
+  // #1866 Emma Zone, #2013 Ivrogne Brutale) are creatures, never a spell. The call with 6
+  // arguments fell back on the `isSpell = true` default of the signature, so this damage
+  // was cut by "réduit de N les dégâts des sorts adverses" (Joris #110) and dodged by
+  // "insensible aux dégâts des sorts" (Atcham #468/#146/#171). The damage of the Héros
+  // Chataîgneur is ability damage, not spell damage, like Black Wabbit.
+  dealSpellDamageThroughGuard(target, dmg, log, creatures, me.instanceId, ctx.casterSide, false, false); // Garde du corps #320/#300 (overflow past the bodyguard)
   // Cancane #775: "Si elle va dans la défausse, elle remonte dans votre main." If the front
   // creature died from this hit, the caster steals/recovers its card to hand, recorded here,
   // executed by runTrigger after death resolution (the card is in its owner's discard by then).
@@ -2361,7 +2767,7 @@ function handleTeleport(
   }
   // cells may be a dice value (Bond du Félin "de 1d6 cases"), roll it from the
   // seeded RNG so the jump distance is reproducible.
-  const cells = Math.max(0, resolveDynamicValue(effect.cells, ctx.rng, ctx.diceFloor) | 0);
+  const cells = Math.max(0, resolveDynamicValue(effect.cells, ctx.rng, ctx.diceFloor, diceSink(log, ctx)) | 0);
   if (cells <= 0) return;
   const dx = c.owner === "ally" ? -1 : 1; // forward = toward the enemy wall
   const y = c.position.y;
@@ -2446,6 +2852,7 @@ function handleTakeControl(
   if (!c) return;
   if (c.owner === ctx.casterSide) return; // already ours, nothing to take
   c.owner = ctx.casterSide;
+  shedDrunkOnControlChange(c, log); // drunkenness does not survive the capture
   // Taking control (Séduction #185...) does not give summoning sickness again. The seized creature
   // becomes ours and plays its turn right away: it gets the "ready" state of a turn start (like
   // startTurn: movementLeft = baseMovement, hasAttacked = false), so it advances at the end of
@@ -2471,6 +2878,11 @@ function handleTakeControl(
 //     at printedLife.
 // A creature is only hit if it actually has something to strip, so the log stays clean. (#220 says
 // only "les invocations", so all sides.)
+// The 3 immobility keywords, in the two sources summonCreature reads to set them:
+// card.properties and the flat SetPropertyData. Used by silence to tell printed
+// immobility (which survives) from immobility given by a spell (which goes away).
+const IMMOBILITY: ReadonlySet<string> = new Set(["Statue", "Rooted", "NoMovementPoints"]);
+
 function handleSilence(
   creatures: CreatureInstance[],
   log: GameEvent[],
@@ -2500,17 +2912,51 @@ function handleSilence(
       c.range > 0 ||
       c.baseAttack !== c.printedAttack ||
       c.baseLife !== c.printedLife ||
-      c.baseMovement !== c.printedMovement;
+      c.baseMovement !== c.printedMovement ||
+      // An ability can live entirely in `card.effects` without leaving any trace on the
+      // instance: cost aura (Felida #216, Silo #849, Piou Royal #542, Héroïne Éternelle #1100),
+      // CHEF aura, reduction, reactive marker. Without this term these creatures were skipped,
+      // `silenced` was never set, and the ~20 `!c.silenced` guards of the engine became dead
+      // code for exactly the cards they were meant to cover: 96 creatures of the catalogue,
+      // including 6 of the 8 earlier silence fixes (#819, #216, #416, #355, #849, #523).
+      // Measured before the fix: Mot de Silence #220 cast directly on a Piou Royal #542 left
+      // `silenced === false` and emitted no FIGHT_OBJECT_SILENCED. A vanilla creature
+      // (`effects: []`) is still ignored, so there is no log noise.
+      // effsOf and not getCard: a copied ability (Anathar #316, textCardId) counts exactly
+      // like a printed ability. Without it, an Anathar whose whole text is passive (CHEF aura,
+      // cost aura, reactive marker) would be skipped by handleSilence, `silenced` would never be
+      // set, and the `!c.silenced` guards of the engine would become dead code on it again,
+      // exactly the regression this term was added to close.
+      effsOf(c).length > 0 ||
+      // Modifiers stamped on the instance with no trace elsewhere: Vulnérabilité, Gangraine
+      // #1439, usurped families (Pupuce #441). Without these terms a creature that only carried
+      // Gangraine was skipped, and silence did nothing on it in particular.
+      c.vulnerability > 0 ||
+      c.movementPoison > 0 ||
+      c.familyOverride != null;
     if (!hadSomething) continue;
 
-    // A Mur (Statue) stays a wall even when silenced, "ne peut jamais se
-    // déplacer … même s'il est réduit au silence". Preserve its immobility
-    // keywords; everything else goes.
-    const keep = new Set<string>();
-    for (const p of ["Statue", "Rooted", "NoMovementPoints"]) {
-      if (c.properties.has(p)) keep.add(p);
+    // A Wall stays a wall even when silenced ("ne peut jamais se déplacer … même s'il est réduit
+    // au silence"), so only the immobility printed on the card is kept. An immobility given from
+    // outside (Enraciné #692, Camouflage #890, Stabilité #2022) is an effect like any other and goes
+    // away with the rest: silence removes every effect and turns a creature into a vanilla one. An
+    // aura immobility (Arakne à Crochets #1457) is granted again just after by withAuras: silence
+    // cuts what a creature gives, not what it receives.
+    const printedImmobility = new Set<string>();
+    {
+      const cd = getCard(c.cardId);
+      for (const q of cd?.properties ?? []) if (IMMOBILITY.has(q)) printedImmobility.add(q);
+      for (const e of cd?.effects ?? []) {
+        if (e.type !== "SetPropertyData") continue;
+        const q = (e as { PropertyType?: string }).PropertyType;
+        if (q && IMMOBILITY.has(q)) printedImmobility.add(q);
+      }
     }
+    const keep = new Set<string>();
+    for (const q of printedImmobility) if (c.properties.has(q)) keep.add(q);
+    const droppedRooted = c.properties.has("Rooted") && !keep.has("Rooted");
     c.properties = keep;
+    c.stunTurns = undefined; // "Stunned" just went away, and so does its multi-turn counter
     c.triggers = [];
     c.resistance = 0;
     c.armor = 0;
@@ -2532,11 +2978,34 @@ function handleSilence(
     c.auraMovement = 0;
     c.auraRange = 0;
     c.auraResistance = 0;
+    // Silence empties `vulnerability` further down (back to vanilla): without this reset, step 1
+    // of withAuras would subtract a stale aura share again from a field already at 0. withAuras
+    // then grants the aura share again if a living, non-silenced Empaleur still gives it.
+    c.auraVulnerability = 0;
     c.auraProperties = new Set<string>();
     // Silence wipes the properties, so the bookkeeping of the conditional keywords that withAuras
     // granted must start again from zero. Otherwise the next reconciliation would try to remove bits
     // that are already gone (and worse, a new grant would wrongly remember them as "already innate").
     c.condProperties = new Set<string>();
+    // Silence removes every effect and turns a creature into a vanilla one. The last
+    // survivors were the negative modifiers stamped on the instance, which nothing else
+    // reset.
+    if (c.vulnerability > 0) {
+      c.vulnerability = 0;
+      log.push({ type: "PROPERTY_UNAPPLIED", instanceId: c.instanceId, property: "Vulnerability" });
+    }
+    if (c.movementPoison > 0) {
+      c.movementPoison = 0;
+      log.push({ type: "PROPERTY_UNAPPLIED", instanceId: c.instanceId, property: "MovementPoison" });
+    }
+    if (droppedRooted) log.push({ type: "PROPERTY_UNAPPLIED", instanceId: c.instanceId, property: "Rooted" });
+    c.familyOverride = undefined; // Pupuce #441: back to the printed families of the card
+    c.textCardId = undefined; // Anathar #316: the copied text goes away with the rest (back to the printed text)
+    // Bookkeeping of conditional auras: the stats were just reset to the printed values, so
+    // these counters of "what is currently folded in" are stale. Leaving them would make
+    // withAuras compute a wrong delta at the next recompute.
+    c.condArmorGranted = 0; // conditional AR (#387/#559), armor was just emptied
+    c.inCampAtk = 0;        // conditional AT "dans votre camp" (Exécuteur Endeuillé #1425)
     c.silenced = true; // persistent marker for the UI overlay (flag ⟺ event)
 
     log.push({ type: "FIGHT_OBJECT_SILENCED", instanceId: c.instanceId });
@@ -2552,7 +3021,7 @@ function handleDamage(
 ): void {
   if (!ctx.targetCell) return;
   const pierceArmor = !!(effect as { pierceArmor?: boolean }).pierceArmor; // PERCE ARMURE (#294)
-  const dmg = resolveDynamicValue(effect.Damage, ctx.rng, ctx.diceFloor);
+  const dmg = resolveDynamicValue(effect.Damage, ctx.rng, ctx.diceFloor, diceSink(log, ctx));
   // Capture the roll when the amount was a die, so a follow-up "sur N ou moins"
   // effect (Dé du Chateux) reacts to this very roll.
   const dv = effect.Damage as { type?: string; dice?: string };
@@ -2584,8 +3053,9 @@ function handleDamage(
   if (dofus) {
     // Lien de Sang #1495: a living creature linked to this Dofus takes the spell damage
     // in its place (its own Shield/Résistance/Armure apply), and the Dofus takes nothing.
+    // A silenced protector no longer protects.
     const guard = dofus.protectedBy != null
-      ? creatures.find((c) => c.instanceId === dofus.protectedBy && c.currentLife > 0)
+      ? creatures.find((c) => c.instanceId === dofus.protectedBy && c.currentLife > 0 && !c.silenced)
       : undefined;
     if (guard) {
       const lifeBefore = guard.currentLife;
@@ -2787,9 +3257,26 @@ function handleHealSelf(
 ): void {
   const me = findSelf(creatures, ctx);
   if (!me || me.currentLife <= 0) return;
+  const heal = effect.Heal | 0;
+  // Sangsuce Tsu Tsu #24: "TOUS les soins deviennent des dégâts." Exact mirror of applyStatMod
+  // (reverseHeal) and handleHealFull; this was the third and last heal path that escaped it.
+  // The self-heal becomes spell damage of the same amount, with the whole chain (spell
+  // insensitivity, anti-spell reduction, Bouclier / Résistance / Vulnérabilité, armour then HP),
+  // and without LIFE_HEALED: a reversed heal is not a heal, so it must not arm the "quand une
+  // invocation est soignée" reactors (Pacificatrice #1519, Dargone #1291, Malox #76). As in
+  // applyStatMod, the inversion short-circuits before the overheal cap: the damage lands even at
+  // full HP. The only card that takes this path today: Luc Ossit #769 (FIN DE TOUR, Heal 1).
+  if (heal > 0 && healsAreReversed(creatures)) {
+    const armorBefore = me.armor;
+    const dealt = applyDamageToCreatureFromSpell(me, heal, log, creatures, ctx.casterSide);
+    if (dealt > 0 || armorBefore > me.armor) {
+      log.push({ type: "DAMAGE", sourceInstanceId: ctx.selfInstanceId ?? -1, targetInstanceId: me.instanceId, damage: dealt, armorHit: armorBefore > me.armor });
+    }
+    return;
+  }
   const before = me.currentLife;
   // Do not overheal past baseLife (in-game cap on heal-self).
-  me.currentLife = Math.min(me.baseLife, me.currentLife + (effect.Heal | 0));
+  me.currentLife = Math.min(me.baseLife, me.currentLife + heal);
   // Emit LIFE_HEALED so a self heal counts as "une invocation est soignée": it triggers the
   // heal-reaction auras (Pacificatrice #1519, Dargone #1291, Malox #76) and shows in the log like
   // any other heal. Since applyHealReactions runs at the end of this applyEffects pass, a
@@ -2818,6 +3305,16 @@ function handleSetProperty(
   const creature = creatures.find(
     (c) => sameCoords(c.position, ctx.targetCell!) && c.currentLife > 0,
   );
+  // Pandawa god: the same guards as handleGrantProperty. A data SetPropertyData "Saoul"
+  // must neither make a non-Pandawa drunk nor miss the new trigger on a target that is
+  // already drunk. No card takes this path today; it is a consistency guard for future data.
+  if (creature && prop === SAOUL) {
+    if (!famsOf(creature).includes("Pandawa")) return;
+    if (creature.properties.has(prop)) {
+      log.push({ type: "PROPERTY_APPLIED", instanceId: creature.instanceId, property: prop });
+      return;
+    }
+  }
   if (creature && !creature.properties.has(prop)) {
     creature.properties = new Set(creature.properties); // clone before mutating the shared Set (aliasing)
     creature.properties.add(prop);

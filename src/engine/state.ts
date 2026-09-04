@@ -78,6 +78,14 @@ export interface CreatureInstance {
   // recomputed by withAuras like auraAttack so it appears only while the
   // creature is wounded and vanishes the instant it is healed back to full.
   auraResistance: number;
+  // Continuous vulnerability received from a board aura ("Donne vulnérabilité N aux invocations
+  // adverses …", Empaleur Embusqué #1217). Folded into `vulnerability`, but counted apart exactly
+  // like auraResistance: withAuras removes it at step 1 and folds it in at step 3, so the aura goes
+  // away by itself (provider dead or silenced, condition no longer met) without ever overwriting
+  // the permanent vulnerability set by a spell (#883 Chronophagie, #1855 Talon d'Achille), which
+  // lives in `vulnerability` alone.
+  // Optional (like condArmorGranted / inCampAtk): absent = 0.
+  auraVulnerability?: number;
   // Properties currently GRANTED to this creature by an allied CHEF property
   // aura (Dan Lemil #718 PierceArmor, Joris #307 Untargetable). Tracked
   // separately so withAuras can revoke them when the chief leaves without
@@ -114,6 +122,15 @@ export interface CreatureInstance {
   //   - Polter Tofu's #358 per-copy +1 surcharge grows from max(0, this value) on death.
   // Optional (treated as 0 when absent).
   playedCostMod?: number;
+  // Pandawa god: FERMENTATION set on the creature at placement. Needed because some
+  // "1(+x)" do not resolve when the creature enters play but much later: Overlin Kwin
+  // gains "1(+x) AT" at the moment it becomes drunk, long after the card left the hand.
+  ferment?: number;
+  // Remaining stun duration, in turns of the carrier. Absent = 1 turn, the old
+  // behaviour (Rose Démoniaque #404). Fiole de Pandapiler (Pandawa god) stuns "pour
+  // 1(+x) tour(s)" and so needs a counter. Taking damage cancels the whole remaining
+  // counter.
+  stunTurns?: number;
   // How much conditional armor (from a ConditionalArmorWhileAlly effect, Rat Devil
   // #387, Boufton Noir #559) is currently folded into `armor`. Unlike auras, armor is
   // a consumable pool, so withAuras grants/removes the bonus only on the condition's
@@ -151,6 +168,14 @@ export interface CreatureInstance {
   // board card tooltip use it. Cleared by transformCreature (a full rebuild takes the token's cost
   // unless set again). Optional (absent → fall back to getCard(cardId).cost).
   costOverride?: number;
+  // Anathar #316 (V2, CopyTextFromTarget): the id of the card whose text applies to this
+  // creature when it is not its own. Same pattern as `familyOverride` (Pupuce #441): the
+  // creature keeps its cardId (art, name, stats, cost), only the text changes. Read everywhere
+  // through effsOf(c) / textIdOf(c) (cardRegistry) for the passive abilities; the triggers are
+  // already per instance in `triggers` and are overwritten by the copy. Cleared by handleSilence
+  // (back to vanilla) and by transformCreature (full rebuild). Optional and backward compatible:
+  // absent = the creature carries the text of its own card.
+  textCardId?: number;
 }
 
 // A Dofus base. Each side has 5 Dofus, one per row on the base column.
@@ -174,6 +199,11 @@ export interface DofusInstance {
   // it never inherits the destination row's colour). Optional for back-compat; the UI
   // falls back to the row index when absent.
   color?: number;
+  // Gueule de Bois #2039: "réduit de 1 les dégâts subis par vos Dofus jusqu'à votre
+  // prochain tour". Taken off each hit (so two Fléaux then deal nothing), set on the five
+  // Dofus of the caster, and reset at the start of their next turn (startTurn). Cumulative:
+  // two copies played in the same turn reduce by 2, like the reduction auras of the pool.
+  damageReduction?: number;
   // Whether this Dofus has been revealed (face-up). All Dofus start unrevealed
   // (undefined/false). A NÉCROME play may optionally reveal one of the caster's
   // own unrevealed Dofus for a second Orbe. Optional so existing literals/tests
@@ -252,6 +282,13 @@ export interface PlayerState {
   // max(0, card.cost + handCostMods[i]). New draws enter with 0, so a hand
   // reduction never carries over to future draws.
   handCostMods: number[];
+  // Pandawa god: FERMENTATION. A "turns spent in the hand" counter, kept for each copy
+  // (playing one copy does not touch the counter of the other). An array aligned on the slots
+  // of the hand, like handCostMods; like handCostTempMods, it may be shorter than the hand (a
+  // slot past its end = 0: the card has not yet spent an end of turn in the hand). +1 per slot
+  // at each end of the holder's turn (tickFerment); fixed and used up at the played slot; a
+  // return to the hand creates a new slot, so it starts again from zero.
+  handFerment?: number[];
   // Per-deck-slot cost modifier, aligned 1:1 with `deck` (same index). The deck
   // analogue of handCostMods: lets a discount accrue on cards still in the deck
   // (HORDE, each HORDE creature death stamps −1 on every HORDE card in hand and
@@ -289,6 +326,12 @@ export interface PlayerState {
   // "vos jets de dé ne peuvent être inférieurs à 3"). 0/undefined = no floor. Set
   // when Dé Pipé resolves, cleared at the player's endTurn (like coinForcedPile).
   diceFloor?: number;
+  // Butin reward locked for this player's turn (V2 Enutrof: Sambalinette #831 élixir,
+  // Creusée #783 pelle, Cupidité #647 pioche antique). Holds the id of the forced reward card;
+  // undefined = the usual draw among the three. Set by ForceButinReward, cleared at the very
+  // end of endTurnInner, after the advance, unlike diceFloor/coinForcedPile, because the lock
+  // must cover the Butins picked up during the move.
+  butinRewardForced?: number;
   // Active traps (Sram) in this player's hand. A placer spell (Piège Mortel #624 …) drops the matching
   // "Activé" card (#681 …) here with a turn counter: the holder must play it within `counter` of their
   // own turns, otherwise at their endTurn each of their Dofus takes `penalty` and the card leaves the
@@ -446,16 +489,20 @@ export interface PendingAction {
   //   - "any_cell"
   filter:
     | "enemy_creature"
+    | "copyable_enemy_creature"
     | "ally_creature"
     | "any_creature"
     | "any_dofus"
     | "any_cell"
     | "own_seed" // a cell carrying one of the picker's own planted seeds (Sadida seed-transform picks)
+    | "own_tas_dos" // a cell with a Tas d'Os of the picker (#738 transforms it, #223/#626 destroy it, the player's choice)
     | "own_empty_camp" // an empty cell of the picker's own territory (Melita's "invoquez un Glyphe dans votre camp")
+    | "free_cell_any_camp" // a free cell of either camp (columns 1..8, never the Dofus columns 0/9): no living creature, no living Dofus, no ground object, but a prism is accepted, the placement replaces it (V2 Erik Rak #720: a cell in any camp, to keep the "prism reset" possible)
     | "own_summon_cell" // a free cell where the picker may summon a creature, spawn zone (+ Bastion extension) or own Buisson (Amalia chooses where her poupée lands)
     | "any_prism" // a cell carrying a prism, any side (Patek Tag's "Détruisez un prisme")
     | "ally_prism" // a cell carrying one of the picker's own prisms (Kibri #735 "Sacrifiez un de vos prismes")
-    | "enemy_prism" // a cell carrying one of the OPPONENT's prisms (Malocac #85 "Récupérez un prisme adverse")
+    | "enemy_prism" // a cell carrying one of the OPPONENT's prisms (Malocac #85 V1 "Récupérez un prisme adverse")
+    | "prism_in_enemy_camp" // a cell in the opponent's half of the picker (columns 1..4 for an allied picker, 5..8 for an enemy picker, the same limits as the AoeScope "enemy_camp") carrying a prism, whoever owns it: Malocac #85 V2 "Récupérez un prisme dans le camp adverse" (your own prism pulled to the opponent's side counts, the opponent's prism pulled to yours no longer does)
     | "own_prismless_first_col" // an empty cell of the picker's own first column (x=8 ally / x=1 enemy) whose prism is missing, Lou 1★ #572 "faites réapparaître un prisme allié" (pick where)
     | "board_object" // a cell carrying a Seed/Trap(Bombe)/Butin/Glyphe/Tas d'os/Cadeau de Nowel, any side (Tournesol Sauvage #1082 "détruisez … en jeu")
     | "ally_glyph" // an empty cell with one of the picker's own Glyphes (Téléglyphe #1735 "sur un glyphe allié")
@@ -531,7 +578,11 @@ export interface PendingAction {
   // deferred, charged again by placeDeferredSummon at landing) so an off-board cancel can give the card
   // back to the hand with the AP intact. `deferredNecrome` marks a held NÉCROME so its base Orbe is only
   // given at landing.
-  summonAfter?: { cardId: number; cell: Coords; owner: Side; cost?: number; playedCostMod?: number; deferredNecrome?: boolean };
+  summonAfter?: { cardId: number; cell: Coords; owner: Side; cost?: number; playedCostMod?: number; deferredNecrome?: boolean;
+    // Pandawa god: FERMENTATION of the played copy. Carried like playedCostMod:
+    // when an APPARITION opens a pick, the creature is only placed on the way back
+    // here, and without it the value set on the creature would be lost.
+    ferment?: number };
   // Set on a summonAfter pick that defers the creature's own targeted APPARITION (as
   // opposed to the FRATRIE keyword's mill): resolvePendingAction lands the creature, then
   // auto-resolves the re-opened APPARITION pick with the target chosen here, so the

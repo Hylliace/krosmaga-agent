@@ -39,6 +39,7 @@ export const PROPERTIES3 = [
   "Ralliement",
   "ReturnToHandOnDeath",
   "Rooted",
+  "Saoul",          // Pandawa god: drunkenness, +1 resistance / −1 MP (withAuras)
   "Shield",
   "SpellDamageInsensitivity",
   "Statue",
@@ -66,6 +67,7 @@ export const TRIGGER_TYPES3 = [
   "ON_PRISM",
   "POST_ADVANCE",
   "RALLIEMENT",
+  "SAOUL",           // Pandawa god: at the moment the creature becomes drunk
 ] as const;
 
 /** Every family referenced by a rule (an effect / trigger filter / pending
@@ -100,6 +102,7 @@ export const FAMILIES3 = [
   "Larve",
   "Moogrr",
   "Mulou",
+  "Pandawa",
   "Phorreur",
   "Pichon",
   "Piou",
@@ -109,6 +112,7 @@ export const FAMILIES3 = [
   "Scara",
   "Sram",
   "Tofu",
+  "Tonneau",
   "Truche",
   "Wabbit",
 ] as const;

@@ -4,7 +4,7 @@
 // them from here. The UI registers the full loaded pool once at startup
 // (App.tsx); tests register the disk pool (testkit). Empty until registered,
 // effects that need a token then no-op rather than throw.
-import type { Card } from "../data/types";
+import type { Card, Effect } from "../data/types";
 
 let registry: Map<number, Card> = new Map();
 // Every family key present in the loaded pool ("Enutrof", "Iop", …). Built once
@@ -76,4 +76,20 @@ export function summonsOfCost(cost: number): number[] {
  *  families. Use this (not getCard(c.cardId).families) for any board creature. */
 export function famsOf(c: { cardId: number; familyOverride?: string[] }): string[] {
   return c.familyOverride ?? getCard(c.cardId)?.families ?? [];
+}
+
+/** The id of the card whose text applies to a creature on the board: the copied card
+ *  (`textCardId`, Anathar #316) if it carries one, otherwise its own. Use this, and never
+ *  `c.cardId`, wherever an ability is looked up. For identity (art, name, stats, cost,
+ *  families), `c.cardId` stays the truth. */
+export function textIdOf(c: { cardId: number; textCardId?: number }): number {
+  return c.textCardId ?? c.cardId;
+}
+
+/** The effective passive effects of a creature on the board, those of the text it really
+ *  carries. Use it everywhere instead of `getCard(c.cardId)?.effects ?? []` for a creature in
+ *  play (the same reason as famsOf for families). Without `textCardId`, the value is strictly
+ *  the same as the old expression. */
+export function effsOf(c: { cardId: number; textCardId?: number }): Effect[] {
+  return getCard(textIdOf(c))?.effects ?? [];
 }

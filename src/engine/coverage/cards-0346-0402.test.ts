@@ -447,6 +447,9 @@ describe("#400 Tofu Enrage - APPARITION : Charge d'autant de cases que vous avez
   // Text: « APPARITION : Charge d'autant de cases que vous avez de Tofus en jeu. » Two
   // qualifiers: "vous" (your Tofus, not the other side's) and the count itself, which
   // sets the charge distance.
+  // Tofu Enragé does not count itself. The text does not say "autres" (unlike Ratou #490,
+  // which does), so the exclusion is a rule decision, not a reading of the text, and it only
+  // holds for this card.
   // #453 Tofu is a plain Tofu with no ability; they are placed outside lane y=0 so they
   // do not block the charge.
   const chargeX = (extras: Parameters<typeof scenario>[0]) => {
@@ -455,33 +458,28 @@ describe("#400 Tofu Enrage - APPARITION : Charge d'autant de cases que vous avez
     return s.creatures.find((c) => c.cardId === 400)!.position.x;
   };
 
-  it("seul en jeu, il est lui-meme un Tofu : il charge de 1 case", () => {
-    expect(chargeX([])).toBe(7); // 8 - 1
+  it("seul en jeu, il ne se compte pas : aucune charge", () => {
+    expect(chargeX([])).toBe(8); // stays on its summon cell
   });
 
-  it("deux Tofus allies de plus : il charge 2 cases de plus", () => {
-    const seul = chargeX([]);
-    const avecDeux = chargeX([
+  // The positive control of the whole describe: it proves that the charge still exists.
+  // Without it, the three "8" below would stay true even if the charge were removed entirely.
+  it("deux Tofus allies : il charge de 2 cases, pas de 3", () => {
+    expect(chargeX([
       mkCreature(60, "ally", { x: 7, y: 3 }, { cardId: 453 }),
       mkCreature(61, "ally", { x: 7, y: 4 }, { cardId: 453 }),
-    ]);
-    expect(seul - avecDeux).toBe(2);
+    ])).toBe(6); // 8 - 2: itself does not add the third cell
   });
 
-  // Both negative tests are written in absolute terms (7 = 8 - 1, the charge from the
-  // single Tofu that is itself) and not as a difference against chargeX([]): a zero
-  // difference would stay true even if the charge were removed entirely.
   it("les Tofus ADVERSES ne comptent pas (« que VOUS avez »)", () => {
-    const avecEnnemis = chargeX([
+    expect(chargeX([
       mkCreature(60, "enemy", { x: 3, y: 3 }, { cardId: 453 }),
       mkCreature(61, "enemy", { x: 3, y: 4 }, { cardId: 453 }),
-    ]);
-    expect(avecEnnemis).toBe(7);
+    ])).toBe(8);
   });
 
   it("un allie qui n'est pas un Tofu ne compte pas (famille)", () => {
-    const avecNonTofu = chargeX([mkCreature(60, "ally", { x: 7, y: 3 }, { cardId: 9999 })]);
-    expect(avecNonTofu).toBe(7);
+    expect(chargeX([mkCreature(60, "ally", { x: 7, y: 3 }, { cardId: 9999 })])).toBe(8);
   });
 });
 
