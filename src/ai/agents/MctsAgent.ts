@@ -599,6 +599,13 @@ export interface MctsOptions {
   shTemp?: number; // temperature of the heuristic logits (score points per nat)
   shCVisit?: number; // c_visit of the value term (50 in Danihelka et al.)
   shCScale?: number; // c_scale of the value term (1.0 in Danihelka et al.)
+  // Expansion order. candidates() sorts the list from best to worst (one-step score) and
+  // adds end of turn / reserve at the tail; expandOne did pop(), so it expanded reserve, end of
+  // turn, then the moves from worst to best. Below the root (most of the budget at 2x80), a move
+  // visited k times only saw its k-1 worst follow-ups, and below an opponent node the simulated
+  // opponent passed and then played its weakest moves first. true = expand from the head of the
+  // list (best first). Off by default until a paired arena decides.
+  expandBestFirst?: boolean;
 }
 
 export class MctsAgent implements Agent {
@@ -614,6 +621,7 @@ export class MctsAgent implements Agent {
   private readonly shTemp: number;
   private readonly shCVisit: number;
   private readonly shCScale: number;
+  private readonly bestFirst: boolean;
   // Set for the duration of a searchRootStats call (per-decision overrides, e.g. a
   // net leaf/prior that captured the root belief). Fall back to the ctor versions.
   private activeLeaf?: LeafEval;
@@ -631,7 +639,8 @@ export class MctsAgent implements Agent {
     this.shTemp = opts.shTemp ?? 150;
     this.shCVisit = opts.shCVisit ?? 50;
     this.shCScale = opts.shCScale ?? 1.0;
-    this.name = `MCTS(${this.simulations}${this.rootSH ? "+SH" : ""})`;
+    this.bestFirst = opts.expandBestFirst ?? false;
+    this.name = `MCTS(${this.simulations}${this.rootSH ? "+SH" : ""}${this.bestFirst ? "+BF" : ""})`;
   }
 
   // Heuristic prior: with ~50 legal moves, a modest budget cannot search deep
@@ -817,7 +826,8 @@ export class MctsAgent implements Agent {
 
   /** Expand one untried action of `node` into a new child and return it. */
   private expandOne(node: Node, rng: Rng): Node {
-    const action = node.untried.pop()!;
+    // See MctsOptions.expandBestFirst: the list is sorted best -> worst.
+    const action = this.bestFirst ? node.untried.shift()! : node.untried.pop()!;
     const child = this.makeNode(applyAction(node.state, action), node, action, rng);
     if (node.priorMap) child.prior = node.priorMap.get(JSON.stringify(action)) ?? 0;
     node.children.push(child);

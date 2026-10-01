@@ -67,6 +67,33 @@ export interface DetMctsOptions extends MctsOptions {
   // Playing it against the normal agent at the same budget bounds what any better
   // belief model could gain. Never used to play or to generate data.
   cheat?: boolean;
+  // Root choice. Over 321 decisions at 2x80 the root visits are nearly uniform (the most
+  // visited move gets 13% of the visits for about 8.6 candidates, second/first = 94% at the
+  // median; UCB1 with c=1.4 almost takes turns when the q gaps are about 0.2), so "most
+  // visited" carries little information and the heuristic tie-break decides: the move played
+  // is not the most visited one in 69% of the decisions. "q" = after the veto, play the argmax
+  // of the mean search value (ties broken by visits). Default "visits" (the old behaviour)
+  // until an arena decides.
+  // Ablation: "heur" = the rule layer alone chooses, the argmax of the one-step heuristic score
+  // (oneStepHeuristicScore, the one of the veto and the tie-break) among the moves that pass the
+  // veto; the visits only break exact ties. It measures what the search and value5 add on top
+  // of the rules, with the same set of candidates. For measurement only.
+  rootPick?: "visits" | "q" | "heur";
+  // Honest root. The veto and the tie-break score each move on blindFoeDofuses(state), which
+  // only hides the kind of the Dofus: the opponent model rollout (completeTurnGreedy) then makes
+  // the opponent play the cards of its real hand. Measured: changing only the hidden hand
+  // changes at least one score in 82% of the decisions, and the set that survives the veto in
+  // 32%. true = the root layer works on a world drawn from the belief (opponent hand and deck
+  // sampled, the draw fixed per decision), like the search. Required whenever the opponent's
+  // hand is really unknown, as against a human. Default false (the old behaviour) until an
+  // arena measures the gap.
+  rootFair?: boolean;
+  // Honest root with K worlds. In the arena, rootFair loses about 6 points against the root
+  // that sees the real hand (p = 0.024); with a single draw of the opponent's hand, the
+  // opponent model rollouts are noisy. K > 1 = each move is scored (veto, tie-break, "heur"
+  // choice) by the mean of its score over K worlds drawn from the belief. K = 1 (default) =
+  // rootFair unchanged.
+  rootFairK?: number;
 }
 
 export class DeterminizedMctsAgent implements Agent {
@@ -83,6 +110,9 @@ export class DeterminizedMctsAgent implements Agent {
   private readonly oppModel: boolean;
   private readonly cheat: boolean;
   private readonly oppK: number;
+  private readonly rootPick: "visits" | "q" | "heur";
+  private readonly rootFair: boolean;
+  private readonly rootFairK: number;
 
   constructor(opts: DetMctsOptions = {}) {
     this.worlds = opts.worlds ?? 6;
@@ -99,7 +129,10 @@ export class DeterminizedMctsAgent implements Agent {
     this.oppModel = opts.oppModel ?? true;
     this.cheat = opts.cheat ?? false;
     this.oppK = opts.oppK ?? 1;
-    const tag = ((opts.makeLeafEval ? "+v" : "") + (opts.makePriorFn ? "+p" : "") || (opts.belief ? "+belief" : "")) + (opts.cheat ? "+cheat" : "") + (opts.rootSH ? "+SH" : "");
+    this.rootPick = opts.rootPick ?? "visits";
+    this.rootFair = opts.rootFair ?? false;
+    this.rootFairK = Math.max(1, Math.floor(opts.rootFairK ?? 1));
+    const tag = ((opts.makeLeafEval ? "+v" : "") + (opts.makePriorFn ? "+p" : "") || (opts.belief ? "+belief" : "")) + (opts.cheat ? "+cheat" : "") + (opts.rootSH ? "+SH" : "") + (opts.expandBestFirst ? "+BF" : "") + (this.rootPick === "q" ? "+Q" : this.rootPick === "heur" ? "+H" : "") + (opts.rootFair ? `+fair${this.rootFairK > 1 ? this.rootFairK : ""}` : "");
     this.name = `DetMCTS(${this.worlds}x${opts.simulations ?? 80}${tag}${opts.explore ? `+x${opts.explore.turns}` : ""})`;
   }
 
@@ -164,16 +197,43 @@ export class DeterminizedMctsAgent implements Agent {
     // blinded state instead: enemy Dofus kinds are re-sampled with a deterministic
     // per-decision seed shared by every candidate, the same information the search
     // has in its own determinized worlds.
-    const blind = this.cheat ? state : blindFoeDofuses(state); // the cheater keeps the real state here too
+    const mondes = this.cheat ? [state] : this.rootFair ? this.fairRoots(state) : [blindFoeDofuses(state)]; // the cheating agent keeps the truth up to the veto and tie-break
+    const blind = mondes[0];
+    const meRacine = actingSide(state);
+    // Root score of a move: the mean over the worlds (only one unless rootFairK > 1).
+    const scoreRacine = (a: Action): number => {
+      let t = 0;
+      for (const m of mondes) t += oneStepHeuristicScore(m, a, meRacine, true, true, this.oppModel, this.oppK);
+      return t / mondes.length;
+    };
     // Root sanity veto: drop root actions that the one-step heuristic rates far below
     // the best-scored root action. The 85% tie-break below only decides near-ties, so
     // a value net that strongly preferred a line that does nothing (charging the
     // opponent's creature for nothing, a spell with zero effect) used to get through.
     // Also applied to exploration sampling, since there is no reason to learn bad lines.
-    const stats = vetoByHeuristic(blind, statsIn, this.vetoMargin, this.oppModel, this.oppK);
+    const stats = vetoByHeuristic(blind, statsIn, this.vetoMargin, this.oppModel, this.oppK, scoreRacine);
     if (this.explore && state.turn <= this.explore.turns) {
       const pick = this.sampleByVisits(stats, this.explore.temperature ?? 1, rng);
       if (pick) return pick;
+    }
+    if (this.rootPick === "heur") {
+      // See DetMctsOptions.rootPick: argmax of the rule score, ties broken by visits.
+      let best: { action: Action; score: number; visits: number } | null = null;
+      for (const v of stats) {
+        const score = scoreRacine(v.action);
+        if (!best || score > best.score || (score === best.score && v.visits > best.visits)) best = { action: v.action, score, visits: v.visits };
+      }
+      return best!.action;
+    }
+    if (this.rootPick === "q") {
+      // See DetMctsOptions.rootPick: the veto stays, the heuristic tie-break at 85% of
+      // the visits is replaced by the value of the search.
+      let bestQ = stats[0];
+      for (const v of stats) {
+        if (v.visits === 0) continue;
+        if (bestQ.visits === 0 || v.q > bestQ.q || (v.q === bestQ.q && v.visits > bestQ.visits)) bestQ = v;
+      }
+      return bestQ.action;
     }
     // Sanity tie-break: the pooled visit counts are the main signal, but when several
     // root actions are within a small margin of the top, the value net could not
@@ -185,13 +245,32 @@ export class DeterminizedMctsAgent implements Agent {
     for (const v of stats) if (v.visits > maxVisits) maxVisits = v.visits;
     const near = stats.filter((v) => v.visits >= maxVisits * 0.85);
     if (near.length === 1) return near[0].action;
-    const me = actingSide(state);
     let best: { action: Action; score: number } | null = null;
     for (const v of near) {
-      const score = oneStepHeuristicScore(blind, v.action, me, true, true, this.oppModel, this.oppK); // rules 8+10 sur l'état AVEUGLÉ (info-fairness)
+      const score = scoreRacine(v.action); // rules 8+10 on the blinded state (info-fairness), averaged over the root worlds
       if (!best || score > best.score || (score === best.score && rng.next() < 0.5)) best = { action: v.action, score };
     }
     return best!.action;
+  }
+
+  /** See DetMctsOptions.rootFair: the world on which the root layer (veto, tie-break,
+   *  rollouts) scores the moves. Opponent hand and deck drawn from the belief (or
+   *  shuffled again without a belief), kind of the enemy Dofus hidden exactly as in
+   *  blindFoeDofuses. The draw comes from state.rng: the same for every move of a
+   *  decision, reproducible, independent of the agent's rng. */
+  private fairRoot(state: GameState, k = 0): GameState {
+    const me = actingSide(state);
+    // k = 0: the same seed as before the K option (rootFair with K = 1 strictly unchanged).
+    const rng = new Rng((state.rng ^ 0x5eedfa1 ^ Math.imul(k, 0x9e3779b1)) | 0);
+    const w = this.belief ? determinizeBelief(state, me, this.belief, rng) : determinize(state, me, rng);
+    return { ...w, dofuses: blindFoeDofuses(state).dofuses };
+  }
+
+  /** The K worlds of the honest root (see DetMctsOptions.rootFairK). */
+  private fairRoots(state: GameState): GameState[] {
+    const out: GameState[] = [];
+    for (let k = 0; k < this.rootFairK; k++) out.push(this.fairRoot(state, k));
+    return out;
   }
 
   /** Opening temperature: sample ∝ visits^(1/T) among positively-visited actions.
@@ -243,11 +322,12 @@ export class DeterminizedMctsAgent implements Agent {
  *  and are vetoed however hard the value net pushes them. Pure and exported for
  *  the sanity tests. Never returns an empty list (the heuristic-best action
  *  always survives). */
-export function vetoByHeuristic<T extends { action: Action }>(state: GameState, stats: T[], margin?: number, oppModel = false, oppK = 1): T[] {
+export function vetoByHeuristic<T extends { action: Action }>(state: GameState, stats: T[], margin?: number, oppModel = false, oppK = 1, score?: (a: Action) => number): T[] {
   if (stats.length <= 1) return stats;
   const me = actingSide(state);
   const m = margin ?? EVAL_WEIGHTS.rootVeto;
-  const scored = stats.map((s) => ({ s, h: oneStepHeuristicScore(state, s.action, me, true, true, oppModel, oppK) })); // rules 8+10: same metric as the tie-break (deep+plan); a veto judged at a shorter horizon could veto the plan-best action
+  // `score`: a scoring given by the agent (e.g. the mean over K root worlds); otherwise a single state.
+  const scored = stats.map((s) => ({ s, h: score ? score(s.action) : oneStepHeuristicScore(state, s.action, me, true, true, oppModel, oppK) })); // rules 8+10: same metric as the tie-break (deep+plan); a veto judged at a shorter horizon could veto the plan-best action
   let hBest = -Infinity;
   for (const e of scored) if (e.h > hBest) hBest = e.h;
   const kept = scored.filter((e) => e.h >= hBest - m).map((e) => e.s);

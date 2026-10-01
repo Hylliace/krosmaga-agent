@@ -85,9 +85,40 @@ async function main(): Promise<void> {
     const SH_A = process.argv.includes("--sh-a");
     // --oppk-a N: size of the portfolio of opponent policies for side A.
     const OPPK_A = parseInt(arg("--oppk-a", "1"), 10);
-    net = new DeterminizedMctsAgent({ ...common, makeLeafEval: valueLeaf, cheat: CHEAT_A, rootSH: SH_A, oppK: OPPK_A });
-    base = new DeterminizedMctsAgent({ worlds: WORLDS_B, simulations: SIMS_B, maxBranch: MAXBRANCH_B, belief: corpusMap, makeLeafEval: valueLeaf });
-    label = `value(${MODEL}) SELF-GAP ${WORLDS}x${SIMS}${CHEAT_A ? " CHEAT" : ""}${SH_A ? " SH" : ""}${OPPK_A > 1 ? ` oppK${OPPK_A}` : ""} (A) vs ${WORLDS_B}x${SIMS_B} (B)`;
+    // --best-first-a / --best-first-b: best-first expansion order (MctsOptions.expandBestFirst)
+    // for side A / side B. The B flag is there to measure the budget curve again with the
+    // change on both sides.
+    const BF_A = process.argv.includes("--best-first-a");
+    const BF_B = process.argv.includes("--best-first-b");
+    // --root-q-a / --root-q-b: root choice by the value of the search after the veto
+    // (DetMctsOptions.rootPick = "q"). --c-a / --c-b: UCB1 exploration constant of each
+    // side (default 1.4).
+    const RQ_A = process.argv.includes("--root-q-a");
+    const RQ_B = process.argv.includes("--root-q-b");
+    const C_A = parseFloat(arg("--c-a", "1.4"));
+    const C_B = parseFloat(arg("--c-b", "1.4"));
+    // --root-fair-a / --root-fair-b: honest root layer (the opponent's hand drawn from the
+    // belief instead of the real one, DetMctsOptions.rootFair).
+    const RF_A = process.argv.includes("--root-fair-a");
+    const RF_B = process.argv.includes("--root-fair-b");
+    // --root-fair-k-a / --root-fair-k-b N: honest root scored on the mean of N worlds
+    // (DetMctsOptions.rootFairK; implies --root-fair-x).
+    const RFK_A = parseInt(arg("--root-fair-k-a", "1"), 10);
+    const RFK_B = parseInt(arg("--root-fair-k-b", "1"), 10);
+    // --root-heur-a / --root-heur-b (ablation): the rule layer alone chooses
+    // (DetMctsOptions.rootPick = "heur"). --veto-a / --veto-b N: root veto margin of each side
+    // (default EVAL_WEIGHTS.rootVeto); "inf" = no veto.
+    const RH_A = process.argv.includes("--root-heur-a");
+    const RH_B = process.argv.includes("--root-heur-b");
+    const veto = (n: string): number | undefined => { const v = arg(n, ""); return v === "" ? undefined : v === "inf" ? Infinity : parseFloat(v); };
+    const VETO_A = veto("--veto-a");
+    const VETO_B = veto("--veto-b");
+    const pick = (q: boolean, h: boolean) => (h ? "heur" : q ? "q" : "visits") as "heur" | "q" | "visits";
+    net = new DeterminizedMctsAgent({ ...common, makeLeafEval: valueLeaf, cheat: CHEAT_A, rootSH: SH_A, oppK: OPPK_A, expandBestFirst: BF_A, rootPick: pick(RQ_A, RH_A), c: C_A, rootFair: RF_A || RFK_A > 1, rootFairK: RFK_A, vetoMargin: VETO_A });
+    base = new DeterminizedMctsAgent({ worlds: WORLDS_B, simulations: SIMS_B, maxBranch: MAXBRANCH_B, belief: corpusMap, makeLeafEval: valueLeaf, expandBestFirst: BF_B, rootPick: pick(RQ_B, RH_B), c: C_B, rootFair: RF_B || RFK_B > 1, rootFairK: RFK_B, vetoMargin: VETO_B });
+    const tagA = `${CHEAT_A ? " CHEAT" : ""}${SH_A ? " SH" : ""}${OPPK_A > 1 ? ` oppK${OPPK_A}` : ""}${BF_A ? " BF" : ""}${RQ_A ? " rootQ" : ""}${C_A !== 1.4 ? ` c${C_A}` : ""}${RF_A || RFK_A > 1 ? ` fair${RFK_A > 1 ? RFK_A : ""}` : ""}${RH_A ? " rootH" : ""}${VETO_A !== undefined ? ` veto${VETO_A}` : ""}`;
+    const tagB = `${BF_B ? " BF" : ""}${RQ_B ? " rootQ" : ""}${C_B !== 1.4 ? ` c${C_B}` : ""}${RF_B || RFK_B > 1 ? ` fair${RFK_B > 1 ? RFK_B : ""}` : ""}${RH_B ? " rootH" : ""}${VETO_B !== undefined ? ` veto${VETO_B}` : ""}`;
+    label = `value(${MODEL}) SELF-GAP ${WORLDS}x${SIMS}${tagA} (A) vs ${WORLDS_B}x${SIMS_B}${tagB} (B)`;
   } else if (MODEL_B) {
     const modelB = loadTsValueModel(MODEL_B);
     net = new DeterminizedMctsAgent({ ...common, makeLeafEval: valueLeaf });
