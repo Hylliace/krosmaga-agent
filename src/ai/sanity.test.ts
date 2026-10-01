@@ -312,6 +312,31 @@ describe("règle 3 affûtée : encaisser la réserve sans rien débloquer est ve
     const pass = oneStepHeuristicScore(s, { kind: "endTurn" }, "ally", true);
     expect(pass - cash).toBeLessThan(100); // pas de malus forfaitaire -> reste votable
   });
+
+  // Plan mode (rule 10) is the one of the veto and of the root tie-break. A bug found in a
+  // real game: the "unlocks a card" test was evaluated on the end of the planned turn, so
+  // it was inverted (cashing without playing anything passed, cashing to play was punished).
+  it("plan mode: cashing with an empty hand is still vetoed", () => {
+    cards();
+    const base = scenario([]);
+    const s = { ...base, players: { ...base.players, ally: { ...base.players.ally, hand: [], handCostMods: [], ap: 1, apReserve: 1 } } };
+    const cash = oneStepHeuristicScore(s, { kind: "reserve" }, "ally", true, true);
+    const pass = oneStepHeuristicScore(s, { kind: "endTurn" }, "ally", true, true);
+    expect(pass - cash).toBeGreaterThan(100);
+  });
+
+  it("plan mode: cashing to play Dragon Cochon (5 AP) is not punished", () => {
+    cards();
+    // A creature with no effect (rule 4 does not apply): the plan plays it after cashing.
+    // Justice does not fit here: the rules prefer to keep it (effect share), and cashing to
+    // keep it is exactly the waste this targets.
+    const DRAGON_COCHON = 449;
+    const base = scenario([], DRAGON_COCHON);
+    const s = { ...base, players: { ...base.players, ally: { ...base.players.ally, ap: 3, apReserve: 2, deck: [16, 16] }, enemy: { ...base.players.enemy, deck: [16, 16] } } };
+    const cash = oneStepHeuristicScore(s, { kind: "reserve" }, "ally", true, true);
+    const pass = oneStepHeuristicScore(s, { kind: "endTurn" }, "ally", true, true);
+    expect(pass - cash).toBeLessThan(100);
+  });
 });
 
 // Rule 9: Autorité #486 (8 AP, "charge jusqu'au Dofus adverse") cast on the player's

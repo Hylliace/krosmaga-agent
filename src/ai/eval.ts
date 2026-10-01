@@ -100,6 +100,12 @@ export const EVAL_WEIGHTS = {
   // nothing gets this flat penalty, sized to trigger the root veto whatever the
   // reserve size.
   pointlessCash: 200,
+  // An immediate win first (seen in a real game: a free Charge on an enemy Cactoblong
+  // played before the winning Autorité). In plan mode (rule 10), any move followed by a
+  // winning completion is worth `win`, like the move that wins right away, and nothing told
+  // them apart. A win that only comes after the completion of the plan loses this amount,
+  // which is more than rootVeto, so as soon as a move wins at once, the veto removes the detours.
+  delayedWin: 150,
   // Rule 9 (Autorité #486 cast on an opponent creature right next to the AI's own
   // real Dofus, 8 AP paid to speed up the loss): the horizon effect turns the eval
   // upside down. The pass line carries a big looming threat term, while the action

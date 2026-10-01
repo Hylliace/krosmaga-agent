@@ -257,6 +257,8 @@ export function oneStepHeuristicScore(state: GameState, a: Action, side: Side, d
   }
   // Rule 10: judge the candidate by the whole turn it starts (root plan mode).
   if (plan) after = completeTurnGreedy(after, side);
+  // A win reached only through the completion of the plan: see EVAL_WEIGHTS.delayedWin.
+  if (after.winner !== null) return evaluate(after, side) - (after.winner === side ? EVAL_WEIGHTS.delayedWin : 0);
   const myEnd = settleHops(applyAction(after, END_TURN));
   const board = deep ? (oppModel ? worstOppBoard(myEnd, side, oppK) : opponentPassRollout(myEnd)) : myEnd;
   let score = evaluate(board, side) - EVAL_WEIGHTS.wastedAp * after.players[side].ap;
@@ -279,14 +281,28 @@ export function oneStepHeuristicScore(state: GameState, a: Action, side: Side, d
   // (the banked reserve would have stayed). A flat penalty, sized to trigger the
   // root veto (the plain ~22/AP gap slipped under it in real games).
   if (a.kind === "reserve") {
-    const playableIds = (s: GameState): Set<number> => {
-      const ids = new Set<number>();
-      for (const act of legalActions(s)) if (act.kind === "play") ids.add(act.cardId);
-      return ids;
-    };
-    const before = playableIds(state);
     let unlocked = false;
-    for (const id of playableIds(after)) if (!before.has(id)) { unlocked = true; break; }
+    if (plan) {
+      // Seen in a real game: the reserve was cashed for 1 AP to pay for a 2 AP Charge,
+      // then the turn ended without playing it. In plan mode, `after` is the end of the planned
+      // turn (rule 10), so the test "one more card is playable" was inverted there: AP cashed
+      // and left unused = a card still playable = no malus; AP spent by the plan = nothing left
+      // to play = a wrong malus. The root veto (plan=true) never saw the waste.
+      // The right test: cashing is useful only if the planned turn after it spends more AP than
+      // the same planned turn without touching the reserve.
+      const p = state.players[side];
+      const sansReserve: GameState = { ...state, players: { ...state.players, [side]: { ...p, apReserve: 0 } } };
+      const base = completeTurnGreedy(sansReserve, side);
+      unlocked = after.players[side].ap < base.players[side].ap + p.apReserve;
+    } else {
+      const playableIds = (s: GameState): Set<number> => {
+        const ids = new Set<number>();
+        for (const act of legalActions(s)) if (act.kind === "play") ids.add(act.cardId);
+        return ids;
+      };
+      const before = playableIds(state);
+      for (const id of playableIds(after)) if (!before.has(id)) { unlocked = true; break; }
+    }
     if (!unlocked) score -= EVAL_WEIGHTS.pointlessCash;
     // Early reserve: the reserveEarly bonus values banked AP because it turns into
     // tempo later. A cash that unlocks a card is exactly that, so it keeps the bonus;
