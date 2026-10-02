@@ -14,6 +14,10 @@ export interface ValueAgentOpts {
   worlds?: number;
   simulations?: number;
   maxBranch?: number;
+  // Honest root (DetMctsOptions.rootFair / rootFairK). Off by default here (self-play and
+  // arena tools unchanged); the game on the site turns it on (browserAgent.ts).
+  rootFair?: boolean;
+  rootFairK?: number;
   // Self-play generation only: opening temperature (see DetMctsOptions.explore).
   explore?: { turns: number; temperature?: number };
 }
@@ -31,6 +35,8 @@ export function makeValueAgent(
     belief: corpusMap,
     makeLeafEval: netLeafEvalFactory(model, cardIndex, corpusMap),
     explore: opts.explore,
+    rootFair: opts.rootFair,
+    rootFairK: opts.rootFairK,
     // No makePriorFn, the policy prior is parked.
   });
 }

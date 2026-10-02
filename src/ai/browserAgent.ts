@@ -19,13 +19,18 @@ import { makeValueAgent } from "./agents/valueAgent";
 
 export type AiStrength = "normale" | "forte";
 
-const BUDGETS: Record<AiStrength, { worlds: number; simulations: number; maxBranch: number }> = {
-  normale: { worlds: 2, simulations: 40, maxBranch: 8 },
+// Honest root: without it, the root layer (veto, tie-break, rollouts) judged the moves while
+// seeing the player's real hand, so the agent cheated (about 6 points in the arena). rootFair
+// with K = 4: the opponent's hand is drawn from the belief, 4 draws averaged (confirmed
+// against K = 1: 40 pairs to 16, p = 0.0018).
+const RACINE = { rootFair: true, rootFairK: 4 } as const;
+const BUDGETS: Record<AiStrength, { worlds: number; simulations: number; maxBranch: number; rootFair: boolean; rootFairK: number }> = {
+  normale: { worlds: 2, simulations: 40, maxBranch: 8, ...RACINE },
   // maxBranch 12 for forte. Arena results: 2x40 = 51.0% (a draw), 6x120 = 51.5%
   // [41.8;61.1] over 99 games (also a draw). Kept anyway: it costs nearly nothing at
   // the same number of simulations, and it matches the teacher that generated the gen4
   // corpus (also at 12), so the deployed forte plays like the teacher of its data.
-  forte: { worlds: 6, simulations: 120, maxBranch: 12 },
+  forte: { worlds: 6, simulations: 120, maxBranch: 12, ...RACINE },
 };
 
 const base = (import.meta as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? "/";
@@ -58,6 +63,6 @@ export async function loadValueAgent(strength: AiStrength): Promise<Agent> {
   const { model, cardIndex, corpusMap } = await loadCore();
   const b = BUDGETS[strength];
   // Trace de vérité pour vérifier quel niveau joue réellement (F12 > Console).
-  console.info(`[AI] agent "${strength}" prêt — recherche ${b.worlds}×${b.simulations} (${b.worlds * b.simulations} simulations/décision)`);
+  console.info(`[AI] agent "${strength}" prêt — recherche ${b.worlds}×${b.simulations} (${b.worlds * b.simulations} simulations/décision), racine équitable K=${b.rootFairK}`);
   return makeValueAgent(model, cardIndex, corpusMap, b);
 }
