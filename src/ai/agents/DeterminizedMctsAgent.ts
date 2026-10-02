@@ -16,6 +16,7 @@ import { EVAL_WEIGHTS } from "../eval";
 import { Rng } from "../../engine/rng";
 import { determinize, resampleEnemyReals } from "../determinize";
 import { determinizeBelief } from "../belief/determinizeBelief";
+import { determinizeInfere, mondesInferes, INFERENCE_DEFAUT, type OptionsInference } from "../belief/inferenceAdverse";
 import type { CorpusBelief } from "../belief/corpus";
 import type { God } from "../../data/types";
 import type { Side } from "../../engine/board";
@@ -94,6 +95,10 @@ export interface DetMctsOptions extends MctsOptions {
   // choice) by the mean of its score over K worlds drawn from the belief. K = 1 (default) =
   // rootFair unchanged.
   rootFairK?: number;
+  // Inference from the opponent's last turn (belief/inferenceAdverse.ts). The worlds (search
+  // and honest root) are drawn in excess, then resampled by the likelihood of the AP the
+  // opponent left unused. true = default settings; an object = explicit settings. Off by default.
+  inferAdv?: boolean | Partial<OptionsInference>;
 }
 
 export class DeterminizedMctsAgent implements Agent {
@@ -113,6 +118,7 @@ export class DeterminizedMctsAgent implements Agent {
   private readonly rootPick: "visits" | "q" | "heur";
   private readonly rootFair: boolean;
   private readonly rootFairK: number;
+  private readonly inferOpts: OptionsInference | null;
 
   constructor(opts: DetMctsOptions = {}) {
     this.worlds = opts.worlds ?? 6;
@@ -132,7 +138,8 @@ export class DeterminizedMctsAgent implements Agent {
     this.rootPick = opts.rootPick ?? "visits";
     this.rootFair = opts.rootFair ?? false;
     this.rootFairK = Math.max(1, Math.floor(opts.rootFairK ?? 1));
-    const tag = ((opts.makeLeafEval ? "+v" : "") + (opts.makePriorFn ? "+p" : "") || (opts.belief ? "+belief" : "")) + (opts.cheat ? "+cheat" : "") + (opts.rootSH ? "+SH" : "") + (opts.expandBestFirst ? "+BF" : "") + (this.rootPick === "q" ? "+Q" : this.rootPick === "heur" ? "+H" : "") + (opts.rootFair ? `+fair${this.rootFairK > 1 ? this.rootFairK : ""}` : "");
+    this.inferOpts = opts.inferAdv ? { ...INFERENCE_DEFAUT, ...(typeof opts.inferAdv === "object" ? opts.inferAdv : {}) } : null;
+    const tag = ((opts.makeLeafEval ? "+v" : "") + (opts.makePriorFn ? "+p" : "") || (opts.belief ? "+belief" : "")) + (opts.cheat ? "+cheat" : "") + (opts.rootSH ? "+SH" : "") + (opts.expandBestFirst ? "+BF" : "") + (this.rootPick === "q" ? "+Q" : this.rootPick === "heur" ? "+H" : "") + (opts.rootFair ? `+fair${this.rootFairK > 1 ? this.rootFairK : ""}` : "") + (this.inferOpts ? "+S5" : "");
     this.name = `DetMCTS(${this.worlds}x${opts.simulations ?? 80}${tag}${opts.explore ? `+x${opts.explore.turns}` : ""})`;
   }
 
@@ -268,6 +275,11 @@ export class DeterminizedMctsAgent implements Agent {
 
   /** The K worlds of the honest root (see DetMctsOptions.rootFairK). */
   private fairRoots(state: GameState): GameState[] {
+    if (this.inferOpts) {
+      // K worlds kept out of K × candidates, a reproducible draw per decision.
+      let k = 0;
+      return mondesInferes(this.rootFairK, () => this.fairRoot(state, k++), actingSide(state), new Rng((state.rng ^ 0x5e5e5) | 0), this.inferOpts);
+    }
     const out: GameState[] = [];
     for (let k = 0; k < this.rootFairK; k++) out.push(this.fairRoot(state, k));
     return out;
@@ -301,8 +313,10 @@ export class DeterminizedMctsAgent implements Agent {
     const priorFn = this.piBar ? undefined : this.makePriorFn?.(state, me);
     // q pooled across worlds VISIT-WEIGHTED (qSum accumulates q×visits).
     const votes = new Map<string, { action: Action; visits: number; qSum: number }>();
+    // Worlds drawn in excess then resampled (otherwise: the usual draw, unchanged).
+    const inferes = this.inferOpts && !this.cheat ? determinizeInfere(state, me, this.belief ?? undefined, this.worlds, rng, this.inferOpts) : null;
     for (let w = 0; w < this.worlds; w++) {
-      const world = this.cheat ? state : this.belief ? determinizeBelief(state, me, this.belief, rng) : determinize(state, me, rng);
+      const world = inferes ? inferes[w] : this.cheat ? state : this.belief ? determinizeBelief(state, me, this.belief, rng) : determinize(state, me, rng);
       for (const s of this.inner.searchRootStats(world, rng, leafEval, priorFn)) {
         const key = JSON.stringify(s.action);
         const cur = votes.get(key);

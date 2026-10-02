@@ -105,6 +105,16 @@ async function main(): Promise<void> {
     // (DetMctsOptions.rootFairK; implies --root-fair-x).
     const RFK_A = parseInt(arg("--root-fair-k-a", "1"), 10);
     const RFK_B = parseInt(arg("--root-fair-k-b", "1"), 10);
+    // --infer-a / --infer-b: worlds weighted by the opponent's last turn
+    // (DetMctsOptions.inferAdv). Settings: --infer-tenue-inv, --infer-tenue-sort,
+    // --infer-candidats (shared by both sides).
+    const inferOpts = {
+      tenueInvocation: parseFloat(arg("--infer-tenue-inv", "0.35")),
+      tenueSort: parseFloat(arg("--infer-tenue-sort", "0.6")),
+      candidats: parseInt(arg("--infer-candidats", "4"), 10),
+    };
+    const INF_A = process.argv.includes("--infer-a") ? inferOpts : undefined;
+    const INF_B = process.argv.includes("--infer-b") ? inferOpts : undefined;
     // --root-heur-a / --root-heur-b (ablation): the rule layer alone chooses
     // (DetMctsOptions.rootPick = "heur"). --veto-a / --veto-b N: root veto margin of each side
     // (default EVAL_WEIGHTS.rootVeto); "inf" = no veto.
@@ -114,10 +124,10 @@ async function main(): Promise<void> {
     const VETO_A = veto("--veto-a");
     const VETO_B = veto("--veto-b");
     const pick = (q: boolean, h: boolean) => (h ? "heur" : q ? "q" : "visits") as "heur" | "q" | "visits";
-    net = new DeterminizedMctsAgent({ ...common, makeLeafEval: valueLeaf, cheat: CHEAT_A, rootSH: SH_A, oppK: OPPK_A, expandBestFirst: BF_A, rootPick: pick(RQ_A, RH_A), c: C_A, rootFair: RF_A || RFK_A > 1, rootFairK: RFK_A, vetoMargin: VETO_A });
-    base = new DeterminizedMctsAgent({ worlds: WORLDS_B, simulations: SIMS_B, maxBranch: MAXBRANCH_B, belief: corpusMap, makeLeafEval: valueLeaf, expandBestFirst: BF_B, rootPick: pick(RQ_B, RH_B), c: C_B, rootFair: RF_B || RFK_B > 1, rootFairK: RFK_B, vetoMargin: VETO_B });
-    const tagA = `${CHEAT_A ? " CHEAT" : ""}${SH_A ? " SH" : ""}${OPPK_A > 1 ? ` oppK${OPPK_A}` : ""}${BF_A ? " BF" : ""}${RQ_A ? " rootQ" : ""}${C_A !== 1.4 ? ` c${C_A}` : ""}${RF_A || RFK_A > 1 ? ` fair${RFK_A > 1 ? RFK_A : ""}` : ""}${RH_A ? " rootH" : ""}${VETO_A !== undefined ? ` veto${VETO_A}` : ""}`;
-    const tagB = `${BF_B ? " BF" : ""}${RQ_B ? " rootQ" : ""}${C_B !== 1.4 ? ` c${C_B}` : ""}${RF_B || RFK_B > 1 ? ` fair${RFK_B > 1 ? RFK_B : ""}` : ""}${RH_B ? " rootH" : ""}${VETO_B !== undefined ? ` veto${VETO_B}` : ""}`;
+    net = new DeterminizedMctsAgent({ ...common, makeLeafEval: valueLeaf, cheat: CHEAT_A, rootSH: SH_A, oppK: OPPK_A, expandBestFirst: BF_A, rootPick: pick(RQ_A, RH_A), c: C_A, rootFair: RF_A || RFK_A > 1, rootFairK: RFK_A, vetoMargin: VETO_A, inferAdv: INF_A });
+    base = new DeterminizedMctsAgent({ worlds: WORLDS_B, simulations: SIMS_B, maxBranch: MAXBRANCH_B, belief: corpusMap, makeLeafEval: valueLeaf, expandBestFirst: BF_B, rootPick: pick(RQ_B, RH_B), c: C_B, rootFair: RF_B || RFK_B > 1, rootFairK: RFK_B, vetoMargin: VETO_B, inferAdv: INF_B });
+    const tagA = `${CHEAT_A ? " CHEAT" : ""}${SH_A ? " SH" : ""}${OPPK_A > 1 ? ` oppK${OPPK_A}` : ""}${BF_A ? " BF" : ""}${RQ_A ? " rootQ" : ""}${C_A !== 1.4 ? ` c${C_A}` : ""}${RF_A || RFK_A > 1 ? ` fair${RFK_A > 1 ? RFK_A : ""}` : ""}${RH_A ? " rootH" : ""}${VETO_A !== undefined ? ` veto${VETO_A}` : ""}${INF_A ? " S5" : ""}`;
+    const tagB = `${BF_B ? " BF" : ""}${RQ_B ? " rootQ" : ""}${C_B !== 1.4 ? ` c${C_B}` : ""}${RF_B || RFK_B > 1 ? ` fair${RFK_B > 1 ? RFK_B : ""}` : ""}${RH_B ? " rootH" : ""}${VETO_B !== undefined ? ` veto${VETO_B}` : ""}${INF_B ? " S5" : ""}`;
     label = `value(${MODEL}) SELF-GAP ${WORLDS}x${SIMS}${tagA} (A) vs ${WORLDS_B}x${SIMS_B}${tagB} (B)`;
   } else if (MODEL_B) {
     const modelB = loadTsValueModel(MODEL_B);
